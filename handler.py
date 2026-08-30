@@ -34,6 +34,19 @@ import numpy as np
 os.environ.setdefault("ATTN_BACKEND", "xformers")
 os.environ.setdefault("SPCONV_ALGO", "native")
 
+# Runpod's cached-model feature puts weights at /runpod-volume/huggingface-cache
+# in the standard HF layout. If HF_HOME points anywhere else, from_pretrained
+# silently re-downloads several GB on every cold start instead of using the
+# cache we asked for. Detect the mount at runtime so the same image works with
+# or without a model attached.
+_RUNPOD_CACHE = "/runpod-volume/huggingface-cache"
+if os.path.isdir(os.path.join(_RUNPOD_CACHE, "hub")):
+    os.environ["HF_HOME"] = _RUNPOD_CACHE
+    print(f"using Runpod model cache at {_RUNPOD_CACHE}", flush=True)
+else:
+    os.environ.setdefault("HF_HOME", "/workspace/hf")
+    print("no Runpod model cache mounted; weights will download on first use", flush=True)
+
 import runpod  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -227,6 +240,10 @@ def probe(event=None):
         status["cuda"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu only"
     except Exception:
         pass
+    status["hf_home"] = os.environ.get("HF_HOME")
+    status["runpod_model_cache"] = os.path.isdir(os.path.join(_RUNPOD_CACHE, "hub"))
+    hub = os.path.join(os.environ.get("HF_HOME", ""), "hub")
+    status["cached_models"] = sorted(os.listdir(hub))[:8] if os.path.isdir(hub) else []
     return status
 
 
