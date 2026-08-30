@@ -56,17 +56,28 @@ RUN pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e402
 # here must not sink the image.
 RUN pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html || \
         echo "kaolin unavailable (mesh export disabled)" ; \
-    pip install git+https://github.com/NVlabs/nvdiffrast.git || \
+    pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git || \
         echo "nvdiffrast unavailable (mesh export disabled)" ; \
-    pip install git+https://github.com/JeffreyXiang/diffoctreerast.git || \
+    pip install --no-build-isolation git+https://github.com/JeffreyXiang/diffoctreerast.git || \
         echo "diffoctreerast unavailable (radiance-field export disabled)"
 
 # The gaussian rasterizer comes from mip-splatting -- which is where TRELLIS'
 # own setup.sh takes it from, not from a TRELLIS submodule. Per-voxel colour
 # depends on it; shape does not.
-RUN git clone https://github.com/autonomousvision/mip-splatting.git /tmp/mip-splatting && \
-    pip install /tmp/mip-splatting/submodules/diff-gaussian-rasterization/ || \
-        echo "gaussian rasterizer unavailable (shape works, colours will not)"
+# --no-build-isolation is mandatory here: setup.py does
+# `from torch.utils.cpp_extension import CUDAExtension` at build time, and an
+# isolated PEP 517 environment contains no torch. Without the flag the build
+# fails with "No module named 'torch'" -- which is exactly what happened.
+#
+# The build log is kept inside the image so the probe can report *why* it failed
+# instead of only that it did. Swallowing this error is what made the missing
+# colour path cost an extra build cycle to explain.
+RUN mkdir -p /workspace && \
+    git clone https://github.com/autonomousvision/mip-splatting.git /tmp/mip-splatting && \
+    ( pip install --no-build-isolation /tmp/mip-splatting/submodules/diff-gaussian-rasterization/ \
+          > /workspace/rasterizer_build.log 2>&1 \
+      && echo "gaussian rasterizer OK" \
+      || echo "gaussian rasterizer FAILED (see /workspace/rasterizer_build.log)" )
 
 WORKDIR /workspace
 RUN git clone --recurse-submodules https://github.com/microsoft/TRELLIS.git /workspace/TRELLIS

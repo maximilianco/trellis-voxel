@@ -247,6 +247,15 @@ def probe(event=None):
         status["cuda"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu only"
     except Exception:
         pass
+    # If the rasterizer is absent, surface the build log rather than leaving the
+    # cause on a machine nobody can log into.
+    if "MISSING" in str(status.get("diff_gaussian_rasterization", "")):
+        try:
+            with open("/workspace/rasterizer_build.log", encoding="utf-8", errors="replace") as handle:
+                tail = [line.rstrip() for line in handle if line.strip()][-12:]
+            status["rasterizer_build_log"] = tail
+        except OSError:
+            status["rasterizer_build_log"] = "no log (layer predates logging)"
     status["hf_home"] = os.environ.get("HF_HOME")
     status["runpod_model_cache"] = os.path.isdir(os.path.join(_RUNPOD_CACHE, "hub"))
     hub = os.path.join(os.environ.get("HF_HOME", ""), "hub")
