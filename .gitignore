@@ -1,0 +1,9 @@
+# Nothing from the parent project belongs here. This repo is only the worker.
+*.mts
+*.npz
+*.safetensors
+*.png
+*.log
+minetest.conf
+weights/
+__pycache__/

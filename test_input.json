@@ -1,0 +1,11 @@
+{
+  "input": {
+    "image_url": "https://raw.githubusercontent.com/microsoft/TRELLIS/main/assets/example_image/T.png",
+    "seed": 0,
+    "resolution": 64,
+    "sparse_steps": 12,
+    "slat_steps": 12,
+    "want_colour": true,
+    "remove_background": true
+  }
+}
