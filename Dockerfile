@@ -34,9 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
 
 RUN pip install \
-        numpy==1.26.4 pillow imageio imageio-ffmpeg scipy tqdm einops \
-        transformers==4.46.3 safetensors huggingface_hub accelerate \
-        onnxruntime rembg trimesh runpod
+# This is TRELLIS' own setup.sh --basic set, not a guess. Omitting easydict
+# alone makes `import trellis` raise ModuleNotFoundError, which looks identical
+# to "TRELLIS is not installed" unless the error message is printed.
+RUN pip install         numpy==1.26.4 pillow imageio imageio-ffmpeg scipy tqdm einops ninja         easydict opencv-python-headless trimesh xatlas pyvista pymeshfix igraph         transformers==4.46.3 safetensors huggingface_hub accelerate         onnxruntime rembg runpod
+# open3d is large and used only by mesh post-processing; never fail the build on it.
+RUN pip install open3d || echo "open3d unavailable (mesh post-processing disabled)"
 
 # Attention and sparse convolution: required by the sparse-structure stage.
 RUN pip install xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/cu121 \
@@ -62,12 +65,11 @@ RUN pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch
 WORKDIR /workspace
 RUN git clone --recurse-submodules https://github.com/microsoft/TRELLIS.git /workspace/TRELLIS
 
-# The gaussian rasterizer ships inside TRELLIS' submodules; it is only needed to
-# *render* gaussians, not to read their positions and colours, which is all the
-# voxel colouring step does.
-RUN pip install /workspace/TRELLIS/extensions/vox2seq/ || echo "vox2seq build failed" ; \
-    pip install /workspace/TRELLIS/submodules/diff-gaussian-rasterization/ || \
-        echo "gaussian rasterizer unavailable (rendering disabled, colours still work)"
+# The gaussian rasterizer comes from mip-splatting, which is where TRELLIS'
+# own setup.sh takes it from. It is what makes per-voxel colour available.
+RUN git clone https://github.com/autonomousvision/mip-splatting.git /tmp/mip-splatting &&     pip install /tmp/mip-splatting/submodules/diff-gaussian-rasterization/ ||         echo "gaussian rasterizer unavailable (shape works, colours will not)"
+# setup.sh still references extensions/vox2seq, but that directory no longer
+# exists in the repo (verified against the git tree) and nothing imports it.
 
 ENV PYTHONPATH=/workspace/TRELLIS:$PYTHONPATH
 

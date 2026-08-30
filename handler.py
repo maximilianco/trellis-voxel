@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import sys
 import time
 import traceback
 
@@ -46,6 +47,9 @@ if os.path.isdir(os.path.join(_RUNPOD_CACHE, "hub")):
 else:
     os.environ.setdefault("HF_HOME", "/workspace/hf")
     print("no Runpod model cache mounted; weights will download on first use", flush=True)
+
+if os.path.isdir("/workspace/TRELLIS") and "/workspace/TRELLIS" not in sys.path:
+    sys.path.insert(0, "/workspace/TRELLIS")
 
 import runpod  # noqa: E402
 from PIL import Image  # noqa: E402
@@ -227,13 +231,16 @@ def probe(event=None):
 
     status = {}
     for module in ("torch", "xformers", "flash_attn", "spconv", "kaolin",
-                   "nvdiffrast", "diffoctreerast", "vox2seq",
+                   "nvdiffrast", "diffoctreerast",
                    "diff_gaussian_rasterization", "trellis"):
         try:
             loaded = importlib.import_module(module)
             status[module] = getattr(loaded, "__version__", "present")
         except Exception as exc:
-            status[module] = f"MISSING ({type(exc).__name__})"
+            # Report *what* was missing. Recording only the exception type once
+            # made a missing `easydict` read as "trellis is not installed",
+            # which cost a full build cycle to work out.
+            status[module] = f"MISSING ({type(exc).__name__}: {exc})"
     try:
         import torch
 
