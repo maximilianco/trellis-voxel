@@ -98,20 +98,38 @@ def _load_image(payload: dict) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGBA")
 
 
-def _occupancy_from_outputs(outputs, resolution: int):
-    """Pull the sparse voxel coordinates out of whatever the pipeline returned."""
+def generate_voxels(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg):
+    """Drive the pipeline stages by hand to keep the occupancy grid.
+
+    `TrellisImageTo3DPipeline.run()` computes the sparse structure and then
+    discards it -- it returns only decoded formats (mesh/gaussian/radiance
+    field). The 64^3 occupancy grid we actually want is the *output of
+    sample_sparse_structure*, so the stages are called directly:
+
+        cond   = get_cond([image])
+        coords = sample_sparse_structure(cond, 1, params)   # (N, 4) [batch,x,y,z]
+        slat   = sample_slat(cond, coords, params)          # only if colour wanted
+        out    = decode_slat(slat, ["gaussian"])            # colour source
+
+    Skipping the slat stage when colour is not requested also roughly halves the
+    runtime, because that is the expensive half.
+    """
     import torch
 
-    for value in outputs.values() if isinstance(outputs, dict) else []:
-        item = value[0] if isinstance(value, (list, tuple)) and value else value
-        coords = getattr(item, "coords", None)
-        if coords is not None:
-            coords = coords.detach().cpu()
-            # TRELLIS sparse tensors carry a leading batch column.
-            if coords.ndim == 2 and coords.shape[1] == 4:
-                coords = coords[:, 1:]
-            return coords.to(torch.int32).numpy()
-    return None
+    pipe = pipeline()
+    cond = pipe.get_cond([image])
+    torch.manual_seed(seed)
+    coords = pipe.sample_sparse_structure(
+        cond, 1, {"steps": sparse_steps, "cfg_strength": cfg},
+    )
+    # argwhere gives [batch, x, y, z]; drop the batch column.
+    voxels = coords[:, 1:].detach().cpu().to(torch.int32).numpy()
+
+    outputs = None
+    if want_colour:
+        slat = pipe.sample_slat(cond, coords, {"steps": slat_steps, "cfg_strength": 3.0})
+        outputs = pipe.decode_slat(slat, ["gaussian"])
+    return voxels, outputs
 
 
 def _colours_for(coords: np.ndarray, outputs, resolution: int):
@@ -177,31 +195,21 @@ def handler(event):
             try:
                 image = pipeline().preprocess_image(image)
             except Exception:
-                pass  # a pre-cut image with alpha is fine as-is
+                pass  # an already-cut image with alpha is fine as-is
         timings["load"] = round(time.time() - started, 2)
 
         mark = time.time()
-        # TRELLIS-1 exposes "gaussian"; TRELLIS.2 exposes a texture stage.
-        formats = payload.get("formats") or (["gaussian"] if want_colour else [])
-        outputs = pipeline().run(
-            image,
-            seed=seed,
-            formats=formats,
-            sparse_structure_sampler_params={
-                "steps": int(payload.get("sparse_steps", 12)),
-                "cfg_strength": float(payload.get("cfg", 7.5)),
-            },
-            slat_sampler_params={
-                "steps": int(payload.get("slat_steps", 12)),
-                "cfg_strength": float(payload.get("cfg", 3.0)),
-            },
+        coords, outputs = generate_voxels(
+            image, seed, resolution, want_colour,
+            int(payload.get("sparse_steps", 12)),
+            int(payload.get("slat_steps", 12)),
+            float(payload.get("cfg", 7.5)),
         )
         timings["generate"] = round(time.time() - mark, 2)
 
-        coords = _occupancy_from_outputs(outputs, resolution)
         if coords is None or not len(coords):
-            return {"error": "no occupied voxels returned",
-                    "output_keys": list(outputs.keys()) if isinstance(outputs, dict) else str(type(outputs))}
+            return {"error": "sparse structure decoded to zero occupied voxels",
+                    "hint": "the subject may have been removed by background cutout"}
 
         mark = time.time()
         colours, colour_source = (None, "none")
