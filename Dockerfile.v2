@@ -32,6 +32,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ATTN_BACKEND=flash-attn \
     SPCONV_ALGO=native
 
+# `pip ... | tee log | tail` exits with tail's status, so a failed extension
+# build would have passed CI silently -- the exact opposite of the "these must
+# not fail quietly" intent further down. pipefail makes the pip failure win.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# CUDA extensions compile one translation unit per core, and an unbounded ninja
+# on a 4-core runner can be OOM-killed -- which surfaces as an inscrutable
+# "Killed" rather than a compiler error.
+ENV MAX_JOBS=4
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 python3.10-dev python3-pip git wget ninja-build \
         build-essential libgl1 libglib2.0-0 libegl1 libgles2 libjpeg-dev \

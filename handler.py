@@ -401,7 +401,11 @@ def probe(event=None):
 
     modules = ["torch", "xformers", "flash_attn", "spconv", "kaolin",
                "nvdiffrast", "diffoctreerast", "diff_gaussian_rasterization", "trellis",
-               "trellis2", "o_voxel", "flexgemm", "cumesh"]
+               # FlexGEMM installs as `flex_gemm`, with an underscore. Probing
+               # for "flexgemm" reported a MISSING extension that had built
+               # perfectly well, which is exactly the kind of false alarm this
+               # probe exists to prevent.
+               "trellis2", "o_voxel", "flex_gemm", "cumesh"]
     status = {}
     for module in modules:
         try:
@@ -428,13 +432,37 @@ def probe(event=None):
         pass
     # If the rasterizer is absent, surface the build log rather than leaving the
     # cause on a machine nobody can log into.
-    if "MISSING" in str(status.get("diff_gaussian_rasterization", "")):
+    if version() == "1" and "MISSING" in str(status.get("diff_gaussian_rasterization", "")):
         try:
             with open("/workspace/rasterizer_build.log", encoding="utf-8", errors="replace") as handle:
                 tail = [line.rstrip() for line in handle if line.strip()][-12:]
             status["rasterizer_build_log"] = tail
         except OSError:
             status["rasterizer_build_log"] = "no log (layer predates logging)"
+    for module, log in (("flex_gemm", "flexgemm"), ("cumesh", "cumesh"), ("o_voxel", "ovoxel")):
+        if "MISSING" in str(status.get(module, "")):
+            try:
+                with open(f"/workspace/{log}_build.log", encoding="utf-8", errors="replace") as handle:
+                    status[f"{log}_build_log"] = [line.rstrip() for line in handle if line.strip()][-15:]
+            except OSError:
+                status[f"{log}_build_log"] = "no log"
+    # TRELLIS.2 conditions on DINOv3, which is a GATED repo: without an accepted
+    # licence and an HF_TOKEN on the endpoint, the pipeline loads fine and then
+    # dies at the first job with a 401. Checking it here costs nothing and turns
+    # a wasted GPU job into one line of probe output.
+    if version() == "2":
+        status["hf_token_set"] = bool(os.environ.get("HF_TOKEN")
+                                      or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+        try:
+            from huggingface_hub import model_info
+
+            model_info("facebook/dinov3-vitl16-pretrain-lvd1689m")
+            status["dinov3_access"] = "ok"
+        except Exception as exc:
+            status["dinov3_access"] = (
+                f"BLOCKED ({type(exc).__name__}: {str(exc)[:160]}) -- accept the "
+                f"licence at huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m "
+                f"and set HF_TOKEN on the endpoint")
     status["trellis_version"] = version()
     status["hf_home"] = os.environ.get("HF_HOME")
     status["runpod_model_cache"] = os.path.isdir(os.path.join(_RUNPOD_CACHE, "hub"))
