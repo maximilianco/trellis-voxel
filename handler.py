@@ -144,6 +144,30 @@ def _load_image(payload: dict) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGBA")
 
 
+def _cutout(image: "Image.Image") -> "Image.Image":
+    """Give the image a real alpha channel using the ungated u2net.
+
+    TRELLIS.2's own preprocess_image reaches for BiRefNet (briaai/RMBG-2.0),
+    which is BOTH gated on HuggingFace and CC BY-NC -- non-commercial only.
+    But it only does so when the input has no meaningful alpha:
+
+        if has_alpha: output = input
+        else:         output = self.rembg_model(input)
+
+    So cutting the background out first means that model is never called. rembg's
+    u2net is already in the image and carries no such restriction, and the
+    geometry work we still want -- square crop about the subject, alpha
+    premultiply -- happens in preprocess_image either way.
+    """
+    import numpy as np
+
+    if image.mode == "RGBA" and not np.all(np.array(image)[:, :, 3] == 255):
+        return image                      # already cut out; nothing to do
+    from rembg import remove
+
+    return remove(image.convert("RGBA"))
+
+
 def reduce_to(coords: np.ndarray, attrs, source: int, target: int):
     """Aggregate a fine voxel grid down to the resolution the caller asked for.
 
@@ -356,10 +380,21 @@ def handler(event):
 
         image = _load_image(payload)
         if payload.get("remove_background", True):
+            # Cut out first, so preprocess_image takes its has_alpha branch and
+            # never loads the gated, non-commercial RMBG-2.0.
+            try:
+                image = _cutout(image)
+            except Exception as exc:
+                print(f"cutout unavailable ({type(exc).__name__}: {exc}); "
+                      f"falling back to the pipeline's own remover", flush=True)
             try:
                 image = pipeline().preprocess_image(image)
-            except Exception:
-                pass  # an already-cut image with alpha is fine as-is
+            except Exception as exc:
+                # Do not swallow this. Skipping it entirely leaves a white
+                # background in the frame, and white background becomes geometry.
+                print(f"WARNING: preprocess_image failed ({type(exc).__name__}: "
+                      f"{exc}); the subject may not be centred or cut out", flush=True)
+                timings["preprocess_error"] = f"{type(exc).__name__}: {exc}"
         timings["load"] = round(time.time() - started, 2)
 
         mark = time.time()
