@@ -288,10 +288,17 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
     import torch
 
     pipe = pipeline()
+    # TRELLIS.2's samplers are FlowEulerGuidanceIntervalSampler and take
+    # `guidance_strength`; `cfg_strength` is TRELLIS-1's name for it. An unknown
+    # key is not rejected here -- it is forwarded into the flow model, so the
+    # wrong name surfaces three minutes in as
+    #     SparseStructureFlowModel.forward() got an unexpected keyword argument
+    # rather than as a bad argument at the call site.
     mesh = pipe.run(
         image,
         seed=seed,
-        sparse_structure_sampler_params={"steps": sparse_steps, "cfg_strength": cfg},
+        sparse_structure_sampler_params={"steps": sparse_steps,
+                                         "guidance_strength": cfg},
         preprocess_image=False,     # already cut out by the caller
     )[0]
 
