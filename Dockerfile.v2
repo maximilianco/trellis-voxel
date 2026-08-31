@@ -84,6 +84,10 @@ RUN pip install flash-attn==2.7.3 --no-build-isolation || \
         echo "flash-attn unavailable; set ATTN_BACKEND=xformers on the endpoint"
 RUN pip install xformers==0.0.29.post3 || echo "xformers unavailable (flash-attn only)"
 
+# rembg fetches u2net on first use, to /root/.u2net, which is not persisted --
+# so every cold worker re-downloaded 176 MB before it could start. Bake it in.
+RUN mkdir -p /root/.u2net &&     wget -q -O /root/.u2net/u2net.onnx       https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx &&     echo "u2net baked: $(du -h /root/.u2net/u2net.onnx | cut -f1)"
+
 WORKDIR /workspace
 RUN git clone --recurse-submodules https://github.com/microsoft/TRELLIS.2.git /workspace/TRELLIS.2
 

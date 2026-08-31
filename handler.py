@@ -149,6 +149,18 @@ def pipeline():
                 print("RMBG-2.0 stubbed; using u2net for cutout "
                       "(set TRELLIS_ALLOW_RMBG=1 to use BiRefNet)", flush=True)
 
+            # from_pretrained loads every model in pipeline.json, and on a cold
+            # worker that read is 62% of the whole job (130s of 210s, measured).
+            # We run the 512 pipeline, so the two 1024 DiTs -- 1.3B parameters
+            # each, about 5 GB of the 16 GB -- are loaded and never used. The
+            # base loader honours a `model_names_to_load` whitelist.
+            if (os.environ.get("TRELLIS_PIPELINE_TYPE") or "512") == "512":
+                Trellis2ImageTo3DPipeline.model_names_to_load = [
+                    "sparse_structure_decoder", "sparse_structure_flow_model",
+                    "shape_slat_decoder", "shape_slat_flow_model_512",
+                    "tex_slat_decoder", "tex_slat_flow_model_512",
+                ]
+                print("loading 512 models only (skipping the 1024 DiTs)", flush=True)
             print(f"loading Trellis2ImageTo3DPipeline from {path}", flush=True)
             _PIPELINE = Trellis2ImageTo3DPipeline.from_pretrained(path)
         else:
@@ -227,7 +239,7 @@ def reduce_to(coords: np.ndarray, attrs, source: int, target: int):
     which is right for colour and for alpha alike.
     """
     if source <= target:
-        return coords, attrs
+        return coords, attrs, np.ones(len(coords), dtype=np.int32)
     binned = np.floor(coords.astype(np.float64) * (target / source)).astype(np.int64)
     binned = np.clip(binned, 0, target - 1)
     key = (binned[:, 0] * target + binned[:, 1]) * target + binned[:, 2]
@@ -237,12 +249,18 @@ def reduce_to(coords: np.ndarray, attrs, source: int, target: int):
     out = np.stack([unique // (target * target),
                     (unique // target) % target,
                     unique % target], axis=1).astype(np.int32)
+    # How many source voxels fell in each output cell. Occupancy alone is
+    # "any voxel present", which inflates thin structure: a ship's rigging is
+    # one or two voxels thick at 512 and becomes a solid block at 64, turning a
+    # 7.7%-fill subject into a 19% lump. The count lets the caller tell a wall
+    # from a rope.
+    density = counts.astype(np.int32)
     if attrs is None:
-        return out, None
+        return out, None, density
     averaged = np.stack(
         [np.bincount(inverse, weights=attrs[:, channel].astype(np.float64)) / counts
          for channel in range(attrs.shape[1])], axis=1)
-    return out, averaged
+    return out, averaged, density
 
 
 def _to_numpy(value, dtype=None):
@@ -287,6 +305,7 @@ def _generate_v1(image, seed, resolution, want_colour, sparse_steps, slat_steps,
             colours, opacity, source = None, None, "failed"
     return {"coords": voxels, "colours": colours, "opacity": opacity,
             "metallic": None, "roughness": None,
+            "density": np.ones(len(voxels), dtype=np.int32),
             "source_resolution": resolution, "colour_source": source}
 
 
@@ -329,16 +348,16 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
 
     attrs = _to_numpy(getattr(mesh, "attrs", None), torch.float32)
     if attrs is None or not want_colour:
-        coords, _ = reduce_to(coords, None, source_resolution, resolution)
+        coords, _, density = reduce_to(coords, None, source_resolution, resolution)
         return {"coords": coords, "colours": None, "opacity": None,
-                "metallic": None, "roughness": None,
+                "metallic": None, "roughness": None, "density": density,
                 "source_resolution": source_resolution, "colour_source": "none"}
 
     layout = getattr(mesh, "layout", None) or {
         "base_color": slice(0, 3), "metallic": slice(3, 4),
         "roughness": slice(4, 5), "alpha": slice(5, 6),
     }
-    coords, attrs = reduce_to(coords, attrs, source_resolution, resolution)
+    coords, attrs, density = reduce_to(coords, attrs, source_resolution, resolution)
 
     def channel(name):
         span = layout.get(name)
@@ -354,6 +373,7 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
         "opacity": None if alpha is None else alpha[:, 0],
         "metallic": None if metallic is None else metallic[:, 0],
         "roughness": None if roughness is None else roughness[:, 0],
+        "density": density,
         "source_resolution": source_resolution,
         "colour_source": "pbr" if colours is not None else "none",
     }
@@ -428,6 +448,28 @@ def _listify(value):
     return None if value is None else np.asarray(value).astype(int).tolist()
 
 
+# Above this many voxels the JSON form is both enormous and slow to build, and
+# Runpod's response limit is a hard wall. A 384-block castle needs a 256 grid,
+# which is roughly 700k voxels -- about 90 MB as JSON lists, ~8 MB packed.
+PACK_THRESHOLD = 150_000
+
+
+def _pack(arrays: dict) -> str:
+    """Compress the voxel arrays into one base64 blob.
+
+    JSON lists of integers cost roughly ten bytes per value. The same data as
+    little-endian binary under zlib is an order of magnitude smaller, which is
+    the difference between a 256-grid fitting in a response and not.
+    """
+    import base64
+    import io
+    import zlib
+
+    buffer = io.BytesIO()
+    np.savez(buffer, **{k: v for k, v in arrays.items() if v is not None})
+    return base64.b64encode(zlib.compress(buffer.getvalue(), 6)).decode("ascii")
+
+
 def handler(event):
     payload = (event or {}).get("input") or {}
     started = time.time()
@@ -480,19 +522,28 @@ def handler(event):
                     "hint": "the subject may have been removed by background cutout"}
         timings["total"] = round(time.time() - started, 2)
 
-        return {
+        payload_out = {
             "resolution": resolution,
             "trellis_version": version(),
             "source_resolution": result.get("source_resolution"),
-            "coords": coords.astype(int).tolist(),
-            "colours": _listify(result.get("colours")),
-            "opacity": _listify(result.get("opacity")),
-            "metallic": _listify(result.get("metallic")),
-            "roughness": _listify(result.get("roughness")),
             "colour_source": result.get("colour_source"),
             "counts": {"voxels": int(len(coords))},
             "timings": timings,
         }
+        fields = {"coords": coords.astype(np.int32),
+                  "colours": result.get("colours"), "opacity": result.get("opacity"),
+                  "metallic": result.get("metallic"), "roughness": result.get("roughness"),
+                  "density": result.get("density")}
+        if len(coords) > PACK_THRESHOLD:
+            payload_out["packed"] = _pack(fields)
+            payload_out["encoding"] = "npz+zlib+base64"
+        else:
+            payload_out["encoding"] = "json"
+            for name, value in fields.items():
+                payload_out[name] = (value.astype(int).tolist()
+                                     if value is not None else None)
+        timings["pack"] = round(time.time() - mark, 2)
+        return payload_out
     except Exception as exc:  # noqa: BLE001 - a failed job must report, not vanish
         return {"error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc(limit=6)}
 
