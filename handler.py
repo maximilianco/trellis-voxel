@@ -133,12 +133,24 @@ def generate_voxels(image, seed, resolution, want_colour, sparse_steps, slat_ste
 
 
 def _colours_for(coords: np.ndarray, outputs, resolution: int):
-    """Colour each occupied voxel from the nearest gaussian's DC term."""
+    """Colour each occupied voxel, and record how opaque it is.
+
+    Opacity is the one material signal TRELLIS-1 actually has. It carries no
+    semantic or PBR channel -- it models radiance, not materials -- but every
+    gaussian has a learned alpha, and a surface the model reconstructed as
+    see-through is a surface it believes you can see through. That is the
+    closest thing to "this is glass" the representation contains, and we were
+    throwing it away by reading only position and the SH DC term.
+
+    (TRELLIS.2 does emit real PBR including per-surface transparency, but only
+    through its mesh/O-Voxel path, which is a different and much heavier route
+    than the sparse-structure grid this worker returns.)
+    """
     import torch
 
     gaussian = (outputs or {}).get("gaussian")
     if not gaussian:
-        return None, "none"
+        return None, None, "none"
     item = gaussian[0] if isinstance(gaussian, (list, tuple)) else gaussian
     positions = getattr(item, "get_xyz", None)
     if positions is None:
@@ -147,7 +159,10 @@ def _colours_for(coords: np.ndarray, outputs, resolution: int):
     if features is None:
         features = getattr(item, "_features_dc", None)
     if positions is None or features is None:
-        return None, "none"
+        return None, None, "none"
+    alpha = getattr(item, "get_opacity", None)
+    if alpha is None:
+        alpha = getattr(item, "_opacity", None)
 
     positions = positions.detach().float().cpu()
     features = features.detach().float().cpu().reshape(positions.shape[0], -1)[:, :3]
@@ -161,8 +176,11 @@ def _colours_for(coords: np.ndarray, outputs, resolution: int):
     total = resolution ** 3
     accumulator = torch.zeros((total, 3), dtype=torch.float32)
     weights = torch.zeros(total, dtype=torch.float32)
+    alphas = torch.zeros(total, dtype=torch.float32)
     accumulator.index_add_(0, flat, rgb)
     weights.index_add_(0, flat, torch.ones(flat.shape[0]))
+    if alpha is not None:
+        alphas.index_add_(0, flat, alpha.detach().float().cpu().reshape(-1).clamp(0, 1))
 
     voxel = torch.from_numpy(coords.astype(np.int64))
     keys = (voxel[:, 0] * resolution + voxel[:, 1]) * resolution + voxel[:, 2]
@@ -174,7 +192,13 @@ def _colours_for(coords: np.ndarray, outputs, resolution: int):
         present = ~missing
         fallback = colours[present].mean(0) if bool(present.any()) else torch.tensor([0.6, 0.6, 0.6])
         colours[missing] = fallback
-    return (colours * 255).round().clamp(0, 255).to(torch.uint8).numpy(), "gaussian"
+    opacity = None
+    if alpha is not None:
+        # A voxel with no gaussian is assumed solid rather than transparent.
+        opacity = (alphas[keys] / counted).clamp(0, 1)
+        opacity[missing] = 1.0
+        opacity = (opacity * 255).round().to(torch.uint8).numpy()
+    return (colours * 255).round().clamp(0, 255).to(torch.uint8).numpy(), opacity, "gaussian"
 
 
 def handler(event):
@@ -212,12 +236,12 @@ def handler(event):
                     "hint": "the subject may have been removed by background cutout"}
 
         mark = time.time()
-        colours, colour_source = (None, "none")
+        colours, opacity, colour_source = (None, None, "none")
         if want_colour:
             try:
-                colours, colour_source = _colours_for(coords, outputs, resolution)
+                colours, opacity, colour_source = _colours_for(coords, outputs, resolution)
             except Exception:
-                colours, colour_source = None, "failed"
+                colours, opacity, colour_source = None, None, "failed"
         timings["colour"] = round(time.time() - mark, 2)
         timings["total"] = round(time.time() - started, 2)
 
@@ -225,6 +249,7 @@ def handler(event):
             "resolution": resolution,
             "coords": coords.astype(int).tolist(),
             "colours": colours.astype(int).tolist() if colours is not None else None,
+            "opacity": opacity.astype(int).tolist() if opacity is not None else None,
             "colour_source": colour_source,
             "counts": {"voxels": int(len(coords))},
             "timings": timings,
