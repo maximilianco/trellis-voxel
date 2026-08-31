@@ -55,9 +55,21 @@ RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.py
 # setup.sh --basic, plus what a serverless worker needs on top of it.
 RUN pip install \
         imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja \
-        trimesh transformers tensorboard pandas lpips zstandard kornia timm \
+        trimesh tensorboard pandas lpips zstandard kornia timm \
         numpy scipy safetensors huggingface_hub accelerate \
         onnxruntime rembg runpod
+
+# transformers is PINNED, unlike TRELLIS.2's own setup.sh which leaves it open.
+# Their DinoV3FeatureExtractor walks the blocks as `self.model.layer`, and that
+# attribute moved: in transformers 4.56 DINOv3ViTModel holds
+#     self.layer = nn.ModuleList([...])
+# directly, while on current main the blocks live in a DINOv3ViTEncoder
+# submodule. An unpinned install therefore loads the model, runs three minutes of
+# generation, and dies with
+#     AttributeError: 'DINOv3ViTModel' object has no attribute 'layer'
+# 4.56.0 is the version the extractor was written against and is verified to
+# have the attribute.
+RUN pip install transformers==4.56.0
 
 # utils3d at the revision TRELLIS.2 pins.
 RUN pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
