@@ -46,6 +46,9 @@ import numpy as np
 
 os.environ.setdefault("ATTN_BACKEND", "xformers")
 os.environ.setdefault("SPCONV_ALGO", "native")
+# TRELLIS.2 allocates in large, uneven blocks and the OOM we hit reported
+# 3.87 GiB reserved but unallocated -- fragmentation, not genuine exhaustion.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Runpod's cached-model feature puts weights at /runpod-volume/huggingface-cache
 # in the standard HF layout. If HF_HOME points anywhere else, from_pretrained
@@ -162,7 +165,18 @@ def pipeline():
             print(f"loading {name} from {path}", flush=True)
             _PIPELINE = cls.from_pretrained(path)
         if torch.cuda.is_available():
-            _PIPELINE.cuda()
+            # Pipeline.cuda() does `for model in self.models.values(): model.to(device)`
+            # -- every model resident at once. TRELLIS.2 ships low_vram=True and
+            # moves each model to self.device for its stage and back to cpu after,
+            # so making them all resident defeats that and is how a 4B model OOMed
+            # a 24 GB card with 22.4 GiB in use. The device property honours an
+            # explicit _device, so point the pipeline at CUDA and let it do the
+            # staging itself.
+            if version() == "2" and getattr(_PIPELINE, "low_vram", False):
+                _PIPELINE._device = torch.device("cuda")
+                print("v2 low_vram: models stay on CPU and move per stage", flush=True)
+            else:
+                _PIPELINE.cuda()
     return _PIPELINE
 
 
@@ -276,7 +290,8 @@ def _generate_v1(image, seed, resolution, want_colour, sparse_steps, slat_steps,
             "source_resolution": resolution, "colour_source": source}
 
 
-def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg):
+def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg,
+                 pipeline_type=None):
     """TRELLIS.2: the O-Voxel output is already a voxel grid with materials.
 
     `run()` returns MeshWithVoxel, whose `coords`/`attrs` are the sparse voxel
@@ -294,12 +309,18 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
     # wrong name surfaces three minutes in as
     #     SparseStructureFlowModel.forward() got an unexpected keyword argument
     # rather than as a bad argument at the call site.
+    # Default to the 512 pipeline rather than the config's 1024_cascade. Not only
+    # to fit the card: the result is reduced to a 64-cube for the schematic, so a
+    # 512 decode is already eight times finer than anything that survives, and
+    # the cascade was spending a second 1024 pass on detail we discard.
+    kind = pipeline_type or os.environ.get("TRELLIS_PIPELINE_TYPE") or "512"
     mesh = pipe.run(
         image,
         seed=seed,
         sparse_structure_sampler_params={"steps": sparse_steps,
                                          "guidance_strength": cfg},
         preprocess_image=False,     # already cut out by the caller
+        pipeline_type=kind,
     )[0]
 
     coords = _to_numpy(mesh.coords, torch.int32).astype(np.int32)
@@ -440,12 +461,16 @@ def handler(event):
         timings["load"] = round(time.time() - started, 2)
 
         mark = time.time()
+        extra = {}
+        if version() == "2":
+            extra["pipeline_type"] = payload.get("pipeline_type")
         generate = _generate_v2 if version() == "2" else _generate_v1
         result = generate(
             image, seed, resolution, want_colour,
             int(payload.get("sparse_steps", 12)),
             int(payload.get("slat_steps", 12)),
             float(payload.get("cfg", 7.5)),
+            **extra,
         )
         timings["generate"] = round(time.time() - mark, 2)
 
