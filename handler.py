@@ -111,6 +111,41 @@ def pipeline():
         if version() == "2":
             from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
+            # from_pretrained builds the background remover unconditionally:
+            #     pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(...)
+            # and that name is BiRefNet, i.e. briaai/RMBG-2.0 -- gated, and
+            # CC BY-NC, non-commercial only. So the pipeline cannot even LOAD
+            # without agreeing to a licence we may not want, however the images
+            # are cut out later.
+            #
+            # __init__ already accepts rembg_model=None, so the model is optional
+            # to the object; only the loader insists. Stubbing the class keeps
+            # that download from ever happening, and _cutout() supplies the alpha
+            # channel with u2net instead, which sends preprocess_image down its
+            # has_alpha branch where rembg_model is never touched.
+            #
+            # Set TRELLIS_ALLOW_RMBG=1 to use the real one, having accepted BRIA's
+            # terms and checked they suit your use.
+            if os.environ.get("TRELLIS_ALLOW_RMBG", "0") != "1":
+                from trellis2.pipelines import rembg as _rembg
+
+                class _UnusedRembg:
+                    """Stands in for BiRefNet so from_pretrained does not fetch it."""
+
+                    def __init__(self, *args, **kwargs):
+                        pass
+
+                    def __call__(self, *args, **kwargs):
+                        raise RuntimeError(
+                            "background removal reached the stubbed RMBG-2.0: the "
+                            "image arrived without an alpha channel. Check that "
+                            "rembg/u2net is installed, or set TRELLIS_ALLOW_RMBG=1 "
+                            "after accepting briaai/RMBG-2.0's non-commercial terms")
+
+                _rembg.BiRefNet = _UnusedRembg
+                print("RMBG-2.0 stubbed; using u2net for cutout "
+                      "(set TRELLIS_ALLOW_RMBG=1 to use BiRefNet)", flush=True)
+
             print(f"loading Trellis2ImageTo3DPipeline from {path}", flush=True)
             _PIPELINE = Trellis2ImageTo3DPipeline.from_pretrained(path)
         else:
