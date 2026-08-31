@@ -1,22 +1,40 @@
-# Build the TRELLIS worker on GitHub's runners and push to GHCR.
+# Build the TRELLIS workers on GitHub's runners and push to GHCR.
 #
 # This exists because the alternatives don't fit: the workstation has a 4 GB GPU,
 # no Docker, 3 GB free on C: and a ~0.5 MB/s uplink, and renting a pod to build
 # means paying for idle GPU. GitHub Actions costs nothing for a public repo,
 # builds on their disk, and pushes from their network.
 #
+# Both generations are built, because they cannot share an image: TRELLIS-1 is
+# linked against torch 2.4/cu121 and TRELLIS.2 against torch 2.6/cu124. The
+# switch between them is which tag the Runpod endpoint runs.
+#
+#   ghcr.io/<repo>:v1          TRELLIS-1  -- known good, gaussian colour + alpha
+#   ghcr.io/<repo>:v2          TRELLIS.2  -- O-Voxel PBR, needs a 24 GB GPU
+#   ghcr.io/<repo>:v{N}-<sha>  immutable, pin this on the endpoint
+#
+# There is deliberately no `:latest`. Runpod does not roll workers when a moving
+# tag changes, so an ambiguous tag turns "did my fix deploy?" into a guess --
+# which already cost several cycles of chasing stale workers.
+#
 # Copy this to .github/workflows/build.yml in the repo you give Runpod.
-name: build trellis worker
+name: build trellis workers
 
 on:
   push:
     branches: [main]
-    paths: ["Dockerfile", "handler.py", ".github/workflows/build.yml"]
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.v2"
+      - "handler.py"
+      - ".github/workflows/build.yml"
   workflow_dispatch:
     inputs:
-      trellis_repo:
-        description: "TRELLIS model repo"
-        default: "microsoft/TRELLIS-image-large"
+      version:
+        description: "Which generation to build: 1, 2, or both"
+        default: "both"
+        type: choice
+        options: ["both", "1", "2"]
       bake_weights:
         description: "Embed weights in the image (0 = use Runpod --model-reference)"
         default: "0"
@@ -27,11 +45,16 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      # A TRELLIS.2 failure must not stop the known-good v1 image publishing.
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(inputs.version == '1' && '["1"]' || inputs.version == '2' && '["2"]' || '["1","2"]') }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # A default runner has ~14 GB free, and this image needs more than that
+      # A default runner has ~14 GB free, and these images need more than that
       # even without baked weights. Removing the preinstalled toolchains we
       # never use frees roughly 25 GB and takes about a minute.
       - name: Reclaim runner disk
@@ -42,6 +65,17 @@ jobs:
                       "$AGENT_TOOLSDIRECTORY" || true
           sudo apt-get clean
           df -h /
+
+      - name: Select the image for this generation
+        id: variant
+        run: |
+          if [ "${{ matrix.version }}" = "2" ]; then
+            echo "dockerfile=Dockerfile.v2" >> "$GITHUB_OUTPUT"
+            echo "model=microsoft/TRELLIS.2-4B" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerfile=Dockerfile" >> "$GITHUB_OUTPUT"
+            echo "model=microsoft/TRELLIS-image-large" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: docker/setup-buildx-action@v3
 
@@ -55,20 +89,27 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ steps.variant.outputs.dockerfile }}
           # Runpod hosts are x86_64.
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/${{ github.repository }}:latest,ghcr.io/${{ github.repository }}:${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository }}:v${{ matrix.version }}
+            ghcr.io/${{ github.repository }}:v${{ matrix.version }}-${{ github.sha }}
           build-args: |
-            TRELLIS_REPO=${{ inputs.trellis_repo || 'microsoft/TRELLIS-image-large' }}
+            TRELLIS_REPO=${{ steps.variant.outputs.model }}
             BAKE_WEIGHTS=${{ inputs.bake_weights || '0' }}
-          # Layer cache in the registry: the CUDA extensions take most of the
-          # build, and they only need recompiling when the dependency layers move.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Layer cache in the registry, scoped per generation: the CUDA
+          # extensions take most of the build, and they only need recompiling
+          # when the dependency layers move. Sharing one scope between two
+          # different torch builds would thrash it.
+          cache-from: type=gha,scope=v${{ matrix.version }}
+          cache-to: type=gha,mode=max,scope=v${{ matrix.version }}
 
       - name: Image reference
         run: |
-          echo "Pushed ghcr.io/${{ github.repository }}:latest"
+          echo "Pushed ghcr.io/${{ github.repository }}:v${{ matrix.version }}"
+          echo "Pin this on the endpoint for a reproducible worker:"
+          echo "  ghcr.io/${{ github.repository }}:v${{ matrix.version }}-${{ github.sha }}"
           echo "If the package is private, add a Runpod container registry auth"
           echo "entry with your GitHub username and a PAT that has read:packages."

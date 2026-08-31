@@ -1,0 +1,123 @@
+# TRELLIS.2 image-to-3D as a RunPod serverless worker.
+#
+# Separate from the TRELLIS-1 Dockerfile on purpose. The two cannot share an
+# image: TRELLIS-1 is built against torch 2.4/cu121 and TRELLIS.2 against
+# torch 2.6/cu124, and every compiled extension below is linked to one exact
+# torch build. The switch between generations is therefore which image the
+# endpoint runs -- ghcr.io/<repo>:v1 or :v2 -- not a runtime flag.
+#
+# Why move: TRELLIS.2's O-Voxel output IS a sparse voxel grid carrying real PBR
+# (base colour, metallic, roughness and alpha per voxel). TRELLIS-1 has no
+# material channel at all, so "is this glass?" had to be inferred from how dark
+# a pane looked -- measured on a generated cottage, that signal does not exist:
+# the wall band's luma spans 84-102 against a median of 95.
+#
+# Requires a 24 GB GPU. Microsoft verified on A100/H100; a 16 GB A4000 is NOT
+# enough. handler.py's probe reports VRAM and warns explicitly.
+#
+# The dependency set below is TRELLIS.2's own setup.sh, flag for flag:
+#   --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
+# Hand-picking a subset is what made `import trellis` fail on a missing easydict
+# last time, and cost a full build cycle to diagnose.
+ARG CUDA_TAG=12.4.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:${CUDA_TAG}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0+PTX" \
+    CUDA_HOME=/usr/local/cuda \
+    PYTHONPATH=/workspace/TRELLIS.2 \
+    TRELLIS_VERSION=2 \
+    ATTN_BACKEND=flash-attn \
+    SPCONV_ALGO=native
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 python3.10-dev python3-pip git wget ninja-build \
+        build-essential libgl1 libglib2.0-0 libegl1 libgles2 libjpeg-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && python -m pip install --upgrade pip setuptools wheel
+
+# Torch first: every extension below compiles against this exact build.
+RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+
+# setup.sh --basic, plus what a serverless worker needs on top of it.
+RUN pip install \
+        imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja \
+        trimesh transformers tensorboard pandas lpips zstandard kornia timm \
+        numpy scipy safetensors huggingface_hub accelerate \
+        onnxruntime rembg runpod
+
+# utils3d at the revision TRELLIS.2 pins.
+RUN pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# A drop-in faster Pillow. It compiles, so it is allowed to fail.
+RUN pip install pillow-simd || echo "pillow-simd unavailable; using stock pillow"
+
+# flash-attn is TRELLIS.2's default attention backend. xformers is the
+# documented fallback for GPUs without flash-attn support; if flash-attn is
+# missing at runtime, set ATTN_BACKEND=xformers on the endpoint.
+RUN pip install flash-attn==2.7.3 --no-build-isolation || \
+        echo "flash-attn unavailable; set ATTN_BACKEND=xformers on the endpoint"
+RUN pip install xformers==0.0.29.post3 || echo "xformers unavailable (flash-attn only)"
+
+WORKDIR /workspace
+RUN git clone --recurse-submodules https://github.com/microsoft/TRELLIS.2.git /workspace/TRELLIS.2
+
+# The four CUDA extensions, exactly as setup.sh builds them.
+#
+# --no-build-isolation is mandatory for every one of these: their setup.py does
+# `from torch.utils.cpp_extension import CUDAExtension` at build time, and an
+# isolated PEP 517 environment contains no torch. Omitting it fails with
+# "No module named 'torch'", which is precisely what happened on the v1 image.
+#
+# FlexGEMM and CuMesh are load-bearing -- FlexGEMM is the sparse convolution the
+# pipeline runs on -- so unlike the v1 renderers these must NOT be swallowed.
+# Their logs are kept in the image so the probe can report why, rather than
+# leaving the cause on a machine nobody can log into.
+RUN git clone --recursive https://github.com/JeffreyXiang/FlexGEMM.git /tmp/extensions/FlexGEMM \
+    && pip install --no-build-isolation /tmp/extensions/FlexGEMM 2>&1 \
+       | tee /workspace/flexgemm_build.log | tail -5
+
+RUN git clone --recursive https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh \
+    && pip install --no-build-isolation /tmp/extensions/CuMesh 2>&1 \
+       | tee /workspace/cumesh_build.log | tail -5
+
+# o-voxel ships inside the TRELLIS.2 checkout rather than as its own repo.
+RUN cp -r /workspace/TRELLIS.2/o-voxel /tmp/extensions/o-voxel \
+    && pip install --no-build-isolation /tmp/extensions/o-voxel 2>&1 \
+       | tee /workspace/ovoxel_build.log | tail -5
+
+# Renderers. The voxel path never rasterises, so these may fail without
+# sinking the image -- but to_glb and the video preview need them.
+RUN git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast \
+    && pip install --no-build-isolation /tmp/extensions/nvdiffrast \
+    || echo "nvdiffrast unavailable (mesh render disabled)"
+
+RUN git clone -b renderutils https://github.com/JeffreyXiang/nvdiffrec.git /tmp/extensions/nvdiffrec \
+    && pip install --no-build-isolation /tmp/extensions/nvdiffrec \
+    || echo "nvdiffrec unavailable (PBR render disabled)"
+
+# Weights are NOT baked in by default.
+#
+# Runpod caches HuggingFace models host-side: attach the model to the endpoint
+# and the worker loads it from /runpod-volume/huggingface-cache with no image
+# bloat and faster cold starts. handler.py detects that mount at runtime.
+# TRELLIS.2-4B is about 16 GB, so baking it makes an already large image worse.
+#
+# Build with --build-arg BAKE_WEIGHTS=1 to embed them instead.
+ARG TRELLIS_REPO=microsoft/TRELLIS.2-4B
+ARG BAKE_WEIGHTS=0
+ENV TRELLIS_MODEL=${TRELLIS_REPO}
+ENV BAKE_WEIGHTS=${BAKE_WEIGHTS}
+
+RUN if [ "$BAKE_WEIGHTS" = "1" ]; then \
+        python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(os.environ['TRELLIS_MODEL'], local_dir='/workspace/weights/'+os.environ['TRELLIS_MODEL'].split('/')[-1])" ; \
+        echo "weights baked into image" ; \
+    else \
+        echo "weights not baked; attach the model to the endpoint instead" ; \
+    fi
+
+COPY handler.py /workspace/handler.py
+CMD ["python", "-u", "/workspace/handler.py"]

@@ -1,13 +1,22 @@
 """RunPod serverless handler: image in, coloured voxel grid out.
 
-Returns TRELLIS' own sparse-structure occupancy rather than a mesh. That stage
-decodes to a 64^3 grid before any renderer runs, so asking for voxels is asking
-for less work, not more -- and it avoids the mesh export path, which is where
-the fragile CUDA extensions live.
+Supports both generations, selected by TRELLIS_VERSION (default: whichever is
+installed). They are NOT interchangeable at runtime -- TRELLIS-1 wants torch
+2.4/cu121 and TRELLIS.2 wants torch 2.6/cu124 -- so the version is fixed when
+the image is built and the switch is which image the endpoint runs. The handler
+auto-detects rather than trusting the variable, so a mismatched env var cannot
+silently produce a broken worker.
 
-Colour comes from the gaussian decoder: each gaussian has a position and a
-spherical-harmonic DC term, which is its base colour. Splatting those onto the
-occupancy grid gives a colour per filled voxel without rendering anything.
+TRELLIS-1 returns the sparse-structure occupancy grid: that stage decodes to
+64^3 before any renderer runs, so asking for voxels is asking for less work than
+asking for a mesh. Colour comes from the gaussian decoder's spherical-harmonic
+DC term, and transparency from each gaussian's learned alpha. There is no
+material channel -- the model reconstructs radiance, not materials.
+
+TRELLIS.2 is the better fit for voxels and the reason to move: its O-Voxel
+output IS a sparse voxel grid carrying real PBR, so `attrs` gives base colour,
+metallic, roughness AND alpha per voxel with no splatting and no inference from
+brightness. Glass stops being a guess.
 
 Input:
     {"image_b64": "...", "seed": 0, "resolution": 64,
@@ -16,10 +25,13 @@ Input:
   or {"image_url": "https://..."}
 
 Output:
-    {"resolution": 64,
+    {"resolution": 64, "trellis_version": "1"|"2",
      "coords": [[x,y,z], ...],          # occupied voxels, grid coordinates
-     "colours": [[r,g,b], ...],         # 0-255, aligned with coords (if available)
-     "counts": {...}, "timings": {...}, "colour_source": "gaussian"|"none"}
+     "colours": [[r,g,b], ...],         # 0-255, aligned with coords
+     "opacity": [a, ...],               # 0-255; low means see-through
+     "metallic": [...], "roughness": [...],   # 0-255, TRELLIS.2 only
+     "counts": {...}, "timings": {...},
+     "colour_source": "pbr"|"gaussian"|"none"}
 """
 from __future__ import annotations
 
@@ -48,17 +60,44 @@ else:
     os.environ.setdefault("HF_HOME", "/workspace/hf")
     print("no Runpod model cache mounted; weights will download on first use", flush=True)
 
-if os.path.isdir("/workspace/TRELLIS") and "/workspace/TRELLIS" not in sys.path:
-    sys.path.insert(0, "/workspace/TRELLIS")
+for _checkout in ("/workspace/TRELLIS", "/workspace/TRELLIS.2"):
+    if os.path.isdir(_checkout) and _checkout not in sys.path:
+        sys.path.insert(0, _checkout)
 
 import runpod  # noqa: E402
 from PIL import Image  # noqa: E402
 
-# A repo id resolves through the HF cache, which is what Runpod's
-# --model-reference populates host-side. A local path also works if the
-# image was built with BAKE_WEIGHTS=1.
-MODEL_PATH = os.environ.get("TRELLIS_MODEL", "microsoft/TRELLIS-image-large")
+_DEFAULT_MODEL = {"1": "microsoft/TRELLIS-image-large", "2": "microsoft/TRELLIS.2-4B"}
 _PIPELINE = None
+_VERSION = None
+
+
+def version() -> str:
+    """Which generation this image actually contains.
+
+    Detected, not declared: TRELLIS_VERSION is a build-time intention and an
+    endpoint can be pointed at the wrong image. Importability is the fact.
+    """
+    global _VERSION
+    if _VERSION is None:
+        import importlib.util
+
+        wanted = str(os.environ.get("TRELLIS_VERSION", "")).strip()
+        has2 = importlib.util.find_spec("trellis2") is not None
+        has1 = importlib.util.find_spec("trellis") is not None
+        if wanted in ("1", "2") and (has2 if wanted == "2" else has1):
+            _VERSION = wanted
+        else:
+            _VERSION = "2" if has2 else "1"
+            if wanted and wanted != _VERSION:
+                print(f"TRELLIS_VERSION={wanted} requested but only "
+                      f"{'trellis2' if has2 else 'trellis'} is installed; "
+                      f"using {_VERSION}", flush=True)
+    return _VERSION
+
+
+def model_path() -> str:
+    return os.environ.get("TRELLIS_MODEL") or _DEFAULT_MODEL[version()]
 
 
 def pipeline():
@@ -67,19 +106,26 @@ def pipeline():
     if _PIPELINE is None:
         import json
         import torch
-        import trellis.pipelines as pipelines
 
-        # TRELLIS-1 and TRELLIS.2 use different pipeline classes but both decode
-        # to the same 64^3 sparse structure, so the voxel path is shared. Read
-        # the name out of pipeline.json rather than guessing from the path.
-        name = "TrellisImageTo3DPipeline"
-        config = os.path.join(MODEL_PATH, "pipeline.json")
-        if os.path.exists(config):
-            with open(config, encoding="utf-8") as handle:
-                name = json.load(handle).get("name", name)
-        cls = getattr(pipelines, name, None) or pipelines.TrellisImageTo3DPipeline
-        print(f"loading {name} from {MODEL_PATH}", flush=True)
-        _PIPELINE = cls.from_pretrained(MODEL_PATH)
+        path = model_path()
+        if version() == "2":
+            from trellis2.pipelines import Trellis2ImageTo3DPipeline
+
+            print(f"loading Trellis2ImageTo3DPipeline from {path}", flush=True)
+            _PIPELINE = Trellis2ImageTo3DPipeline.from_pretrained(path)
+        else:
+            import trellis.pipelines as pipelines
+
+            # Read the class name out of pipeline.json rather than guessing it
+            # from the path.
+            name = "TrellisImageTo3DPipeline"
+            config = os.path.join(path, "pipeline.json")
+            if os.path.exists(config):
+                with open(config, encoding="utf-8") as handle:
+                    name = json.load(handle).get("name", name)
+            cls = getattr(pipelines, name, None) or pipelines.TrellisImageTo3DPipeline
+            print(f"loading {name} from {path}", flush=True)
+            _PIPELINE = cls.from_pretrained(path)
         if torch.cuda.is_available():
             _PIPELINE.cuda()
     return _PIPELINE
@@ -98,21 +144,52 @@ def _load_image(payload: dict) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGBA")
 
 
-def generate_voxels(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg):
-    """Drive the pipeline stages by hand to keep the occupancy grid.
+def reduce_to(coords: np.ndarray, attrs, source: int, target: int):
+    """Aggregate a fine voxel grid down to the resolution the caller asked for.
+
+    TRELLIS.2 decodes at up to 1024^3. Returning that as JSON would be hundreds
+    of megabytes and blow past Runpod's response limit, and the schematic is a
+    few dozen blocks across regardless -- so the reduction belongs on the GPU
+    box, not on the far side of the wire. Attributes are averaged within a cell,
+    which is right for colour and for alpha alike.
+    """
+    if source <= target:
+        return coords, attrs
+    binned = np.floor(coords.astype(np.float64) * (target / source)).astype(np.int64)
+    binned = np.clip(binned, 0, target - 1)
+    key = (binned[:, 0] * target + binned[:, 1]) * target + binned[:, 2]
+    unique, inverse = np.unique(key, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    counts = np.bincount(inverse).astype(np.float64)
+    out = np.stack([unique // (target * target),
+                    (unique // target) % target,
+                    unique % target], axis=1).astype(np.int32)
+    if attrs is None:
+        return out, None
+    averaged = np.stack(
+        [np.bincount(inverse, weights=attrs[:, channel].astype(np.float64)) / counts
+         for channel in range(attrs.shape[1])], axis=1)
+    return out, averaged
+
+
+def _to_numpy(value, dtype=None):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+        if dtype is not None:
+            value = value.to(dtype)
+        return value.numpy()
+    return np.asarray(value)
+
+
+def _generate_v1(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg):
+    """Drive the stages by hand to keep the occupancy grid.
 
     `TrellisImageTo3DPipeline.run()` computes the sparse structure and then
-    discards it -- it returns only decoded formats (mesh/gaussian/radiance
-    field). The 64^3 occupancy grid we actually want is the *output of
-    sample_sparse_structure*, so the stages are called directly:
-
-        cond   = get_cond([image])
-        coords = sample_sparse_structure(cond, 1, params)   # (N, 4) [batch,x,y,z]
-        slat   = sample_slat(cond, coords, params)          # only if colour wanted
-        out    = decode_slat(slat, ["gaussian"])            # colour source
-
-    Skipping the slat stage when colour is not requested also roughly halves the
-    runtime, because that is the expensive half.
+    discards it -- it returns only decoded formats. The 64^3 grid we want is the
+    *output of sample_sparse_structure*, so the stages are called directly.
+    Skipping the slat stage when colour is not wanted roughly halves the runtime.
     """
     import torch
 
@@ -129,22 +206,81 @@ def generate_voxels(image, seed, resolution, want_colour, sparse_steps, slat_ste
     if want_colour:
         slat = pipe.sample_slat(cond, coords, {"steps": slat_steps, "cfg_strength": 3.0})
         outputs = pipe.decode_slat(slat, ["gaussian"])
-    return voxels, outputs
+    colours, opacity, source = (None, None, "none")
+    if outputs is not None:
+        try:
+            colours, opacity, source = _gaussian_appearance(voxels, outputs, resolution)
+        except Exception:
+            colours, opacity, source = None, None, "failed"
+    return {"coords": voxels, "colours": colours, "opacity": opacity,
+            "metallic": None, "roughness": None,
+            "source_resolution": resolution, "colour_source": source}
 
 
-def _colours_for(coords: np.ndarray, outputs, resolution: int):
+def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg):
+    """TRELLIS.2: the O-Voxel output is already a voxel grid with materials.
+
+    `run()` returns MeshWithVoxel, whose `coords`/`attrs` are the sparse voxel
+    grid and its per-voxel PBR. `layout` gives the channel slices --
+    base_color 0:3, metallic 3:4, roughness 4:5, alpha 5:6 -- all in 0..1. No
+    gaussian splatting, and transparency is a property the model actually
+    predicted rather than something inferred from how dark a pane looks.
+    """
+    import torch
+
+    pipe = pipeline()
+    mesh = pipe.run(
+        image,
+        seed=seed,
+        sparse_structure_sampler_params={"steps": sparse_steps, "cfg_strength": cfg},
+        preprocess_image=False,     # already cut out by the caller
+    )[0]
+
+    coords = _to_numpy(mesh.coords, torch.int32).astype(np.int32)
+    voxel_size = float(getattr(mesh, "voxel_size", 0) or 0)
+    source_resolution = int(round(1.0 / voxel_size)) if voxel_size > 0 else resolution
+
+    attrs = _to_numpy(getattr(mesh, "attrs", None), torch.float32)
+    if attrs is None or not want_colour:
+        coords, _ = reduce_to(coords, None, source_resolution, resolution)
+        return {"coords": coords, "colours": None, "opacity": None,
+                "metallic": None, "roughness": None,
+                "source_resolution": source_resolution, "colour_source": "none"}
+
+    layout = getattr(mesh, "layout", None) or {
+        "base_color": slice(0, 3), "metallic": slice(3, 4),
+        "roughness": slice(4, 5), "alpha": slice(5, 6),
+    }
+    coords, attrs = reduce_to(coords, attrs, source_resolution, resolution)
+
+    def channel(name):
+        span = layout.get(name)
+        if span is None or attrs.shape[1] < (span.stop or 0):
+            return None
+        return np.clip(attrs[:, span] * 255.0, 0, 255).round().astype(np.uint8)
+
+    colours, alpha = channel("base_color"), channel("alpha")
+    metallic, roughness = channel("metallic"), channel("roughness")
+    return {
+        "coords": coords,
+        "colours": colours,
+        "opacity": None if alpha is None else alpha[:, 0],
+        "metallic": None if metallic is None else metallic[:, 0],
+        "roughness": None if roughness is None else roughness[:, 0],
+        "source_resolution": source_resolution,
+        "colour_source": "pbr" if colours is not None else "none",
+    }
+
+
+def _gaussian_appearance(coords: np.ndarray, outputs, resolution: int):
     """Colour each occupied voxel, and record how opaque it is.
 
-    Opacity is the one material signal TRELLIS-1 actually has. It carries no
-    semantic or PBR channel -- it models radiance, not materials -- but every
-    gaussian has a learned alpha, and a surface the model reconstructed as
-    see-through is a surface it believes you can see through. That is the
-    closest thing to "this is glass" the representation contains, and we were
-    throwing it away by reading only position and the SH DC term.
-
-    (TRELLIS.2 does emit real PBR including per-surface transparency, but only
-    through its mesh/O-Voxel path, which is a different and much heavier route
-    than the sparse-structure grid this worker returns.)
+    Opacity is the only material signal TRELLIS-1 carries. It has no semantic or
+    PBR channel -- it models radiance, not materials -- but every gaussian has a
+    learned alpha, and a surface the model reconstructed as see-through is one it
+    believes you can see through. That is the closest thing to "this is glass"
+    the representation contains, and reading only position and the SH DC term
+    threw it away.
     """
     import torch
 
@@ -201,6 +337,10 @@ def _colours_for(coords: np.ndarray, outputs, resolution: int):
     return (colours * 255).round().clamp(0, 255).to(torch.uint8).numpy(), opacity, "gaussian"
 
 
+def _listify(value):
+    return None if value is None else np.asarray(value).astype(int).tolist()
+
+
 def handler(event):
     payload = (event or {}).get("input") or {}
     started = time.time()
@@ -208,7 +348,7 @@ def handler(event):
     # Probing over the API rather than `docker run --gpus` matters: the machine
     # driving this may not have a CUDA GPU, and it does not need one.
     if payload.get("probe"):
-        return {"probe": probe(), "model_path": MODEL_PATH}
+        return {"probe": probe(), "model_path": model_path(), "trellis_version": version()}
     try:
         resolution = int(payload.get("resolution", 64))
         seed = int(payload.get("seed", 0))
@@ -223,7 +363,8 @@ def handler(event):
         timings["load"] = round(time.time() - started, 2)
 
         mark = time.time()
-        coords, outputs = generate_voxels(
+        generate = _generate_v2 if version() == "2" else _generate_v1
+        result = generate(
             image, seed, resolution, want_colour,
             int(payload.get("sparse_steps", 12)),
             int(payload.get("slat_steps", 12)),
@@ -231,26 +372,22 @@ def handler(event):
         )
         timings["generate"] = round(time.time() - mark, 2)
 
+        coords = result["coords"]
         if coords is None or not len(coords):
-            return {"error": "sparse structure decoded to zero occupied voxels",
+            return {"error": "decoded to zero occupied voxels",
                     "hint": "the subject may have been removed by background cutout"}
-
-        mark = time.time()
-        colours, opacity, colour_source = (None, None, "none")
-        if want_colour:
-            try:
-                colours, opacity, colour_source = _colours_for(coords, outputs, resolution)
-            except Exception:
-                colours, opacity, colour_source = None, None, "failed"
-        timings["colour"] = round(time.time() - mark, 2)
         timings["total"] = round(time.time() - started, 2)
 
         return {
             "resolution": resolution,
+            "trellis_version": version(),
+            "source_resolution": result.get("source_resolution"),
             "coords": coords.astype(int).tolist(),
-            "colours": colours.astype(int).tolist() if colours is not None else None,
-            "opacity": opacity.astype(int).tolist() if opacity is not None else None,
-            "colour_source": colour_source,
+            "colours": _listify(result.get("colours")),
+            "opacity": _listify(result.get("opacity")),
+            "metallic": _listify(result.get("metallic")),
+            "roughness": _listify(result.get("roughness")),
+            "colour_source": result.get("colour_source"),
             "counts": {"voxels": int(len(coords))},
             "timings": timings,
         }
@@ -262,10 +399,11 @@ def probe(event=None):
     """Report which optional extensions built, so a failure is diagnosable."""
     import importlib
 
+    modules = ["torch", "xformers", "flash_attn", "spconv", "kaolin",
+               "nvdiffrast", "diffoctreerast", "diff_gaussian_rasterization", "trellis",
+               "trellis2", "o_voxel", "flexgemm", "cumesh"]
     status = {}
-    for module in ("torch", "xformers", "flash_attn", "spconv", "kaolin",
-                   "nvdiffrast", "diffoctreerast",
-                   "diff_gaussian_rasterization", "trellis"):
+    for module in modules:
         try:
             loaded = importlib.import_module(module)
             status[module] = getattr(loaded, "__version__", "present")
@@ -278,6 +416,14 @@ def probe(event=None):
         import torch
 
         status["cuda"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu only"
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            status["vram_gb"] = round(total, 1)
+            # TRELLIS.2 is documented as needing 24 GB. Saying so here turns a
+            # baffling mid-job OOM into a line in the probe.
+            if version() == "2" and total < 23:
+                status["vram_warning"] = (
+                    f"TRELLIS.2 wants >=24 GB; this worker has {total:.1f} GB")
     except Exception:
         pass
     # If the rasterizer is absent, surface the build log rather than leaving the
@@ -289,6 +435,7 @@ def probe(event=None):
             status["rasterizer_build_log"] = tail
         except OSError:
             status["rasterizer_build_log"] = "no log (layer predates logging)"
+    status["trellis_version"] = version()
     status["hf_home"] = os.environ.get("HF_HOME")
     status["runpod_model_cache"] = os.path.isdir(os.path.join(_RUNPOD_CACHE, "hub"))
     hub = os.path.join(os.environ.get("HF_HOME", ""), "hub")

@@ -1,25 +1,59 @@
 # trellis-voxel
 
 A [RunPod serverless](https://runpod.io) worker that turns an image into a
-coloured voxel grid using [TRELLIS](https://github.com/microsoft/TRELLIS).
+coloured voxel grid using [TRELLIS](https://github.com/microsoft/TRELLIS) or
+[TRELLIS.2](https://github.com/microsoft/TRELLIS.2).
 
-Send it a picture, get back occupied voxel coordinates and an RGB colour per
-voxel. No mesh, no renderer.
+Send it a picture, get back occupied voxel coordinates with a colour — and, on
+TRELLIS.2, real PBR materials — per voxel. No mesh, no renderer.
 
 ## Why it returns voxels rather than a mesh
 
-TRELLIS is voxel-based internally. Its first stage — `ss_flow_img_dit_L_16l8`
-into `ss_dec_conv3d_16l8` — decodes to a **64³ occupancy grid** before any mesh,
-gaussian or radiance-field decoder runs. So reading voxels out is reading the
-pipeline's own intermediate representation, not post-processing a mesh.
+Both generations are voxel-based internally.
 
-That also means the fragile CUDA extensions used only for mesh export
-(`nvdiffrast`, `kaolin`, `diffoctreerast`) are optional here, and the Dockerfile
-treats them as such.
+**TRELLIS-1's** first stage — `ss_flow_img_dit_L_16l8` into `ss_dec_conv3d_16l8`
+— decodes to a **64³ occupancy grid** before any mesh, gaussian or
+radiance-field decoder runs. Reading voxels out is reading the pipeline's own
+intermediate representation, not post-processing a mesh. That also means the
+fragile CUDA extensions used only for mesh export (`nvdiffrast`, `kaolin`,
+`diffoctreerast`) are optional, and the v1 Dockerfile treats them as such.
 
-Colour comes from the gaussian decoder: every gaussian carries a position and a
-spherical-harmonic DC term, which is its base colour. Those are splatted onto the
-occupancy grid — no rendering involved.
+**TRELLIS.2's** O-Voxel output *is* a sparse voxel grid: `mesh.coords` with a
+per-voxel `mesh.attrs`. This is the better fit and the reason to move.
+
+## The two generations
+
+They cannot share an image — TRELLIS-1 links against torch 2.4/cu121 and
+TRELLIS.2 against torch 2.6/cu124, and every compiled extension is bound to one
+exact torch build. So there are two Dockerfiles and two tags, and **the switch is
+which tag the endpoint runs**:
+
+| | tag | Dockerfile | GPU | materials |
+|---|---|---|---|---|
+| TRELLIS-1 | `:v1` | `Dockerfile` | 16 GB is enough | colour + alpha only |
+| TRELLIS.2 | `:v2` | `Dockerfile.v2` | **24 GB required** | base colour, metallic, roughness, alpha |
+
+`handler.py` is shared and detects which generation is installed by import,
+rather than trusting `TRELLIS_VERSION` — an endpoint can be pointed at the wrong
+image, and importability is the fact.
+
+To roll back, point the endpoint at `:v1` (or the `trellis-1-working` tag in git
+history) and recycle the workers.
+
+### What the material channel is worth
+
+TRELLIS-1 has **no material channel**. It reconstructs radiance, not materials.
+The closest thing it carries is each gaussian's learned opacity — a surface the
+model rebuilt as see-through is one it thinks you can see through — so the v1
+path exports that as `opacity`.
+
+Inferring glass from brightness instead does not work, and that is measured, not
+assumed: on a generated stone cottage the wall band's luma spans 84–102 against a
+median of 95, under a tenth of a stop, and the only genuinely dark clusters are
+the eave shadow and the ground shadow.
+
+TRELLIS.2 predicts `base_color`, `metallic`, `roughness` and `alpha` per voxel
+directly, so glass and metal stop being guesses.
 
 ## API
 
@@ -44,49 +78,71 @@ Response:
 ```json
 { "output": {
     "resolution": 64,
+    "trellis_version": "2",
+    "source_resolution": 256,
     "coords": [[31, 20, 33]],
     "colours": [[194, 142, 90]],
-    "colour_source": "gaussian",
+    "opacity": [255],
+    "metallic": [12],
+    "roughness": [180],
+    "colour_source": "pbr",
     "counts": { "voxels": 18342 },
     "timings": { "generate": 6.1, "total": 7.4 }
 } }
 ```
 
+`metallic` and `roughness` are `null` on TRELLIS-1. `colour_source` is `"pbr"`,
+`"gaussian"` or `"none"`.
+
+`resolution` is the grid you asked for; `source_resolution` is what the model
+decoded at. TRELLIS.2 can decode at up to 1024³, which as JSON would be hundreds
+of megabytes and would blow past RunPod's response limit — so the worker
+aggregates down to `resolution` before replying, averaging attributes within
+each cell.
+
 `{"input": {"probe": true}}` returns which optional CUDA extensions actually
-built — useful because you cannot check that without a GPU.
+built, plus the GPU and its VRAM — useful because you cannot check that without
+a GPU. On a v2 worker with under 23 GB it also returns a `vram_warning`, which
+turns a baffling mid-job OOM into one readable line.
 
 ## Deploy
 
-Push this repo, let the included workflow build and publish to GHCR, then create
-a RunPod serverless endpoint from `ghcr.io/<you>/trellis-voxel:latest`.
+Push this repo and the included workflow builds **both** images and publishes
+them to GHCR. Then create a RunPod serverless endpoint from the tag you want.
 
-| setting | value |
-|---|---|
-| GPU | RTX A4000 16 GB (enough for `TRELLIS-image-large`) |
-| Active workers | 0 — nothing is billed while idle |
-| Max workers | 1 |
-| Container disk | 25 GB |
-
-Weights are **not** baked into the image. Attach them host-side instead:
+There is deliberately **no `:latest`**. RunPod does not roll workers when a
+moving tag changes, so an ambiguous tag turns "did my fix deploy?" into a guess.
+Pin the immutable tag instead:
 
 ```
---model-reference microsoft/TRELLIS-image-large
+ghcr.io/<you>/trellis-voxel:v2-<commit sha>
+```
+
+| setting | v1 | v2 |
+|---|---|---|
+| GPU | RTX A4000 16 GB | 24 GB (A5000 / L4 / 4090 / A100) |
+| Active workers | 0 — nothing is billed while idle | 0 |
+| Max workers | 1 | 1 |
+| Container disk | 25 GB | 40 GB |
+
+Weights are **not** baked into either image. Attach them host-side instead:
+
+```
+--model-reference microsoft/TRELLIS-image-large     # v1
+--model-reference microsoft/TRELLIS.2-4B            # v2
 ```
 
 Smaller image, faster cold starts, and no monthly storage cost. Build with
 `--build-arg BAKE_WEIGHTS=1` if you would rather embed them.
 
-## Model choice
-
-| | weights | est. peak VRAM |
+| | weights | GPU |
 |---|---|---|
-| `microsoft/TRELLIS-image-large` | 3.3 GB | ~6–8 GB |
-| `microsoft/TRELLIS.2-4B` | 16.2 GB | ~10–16 GB |
+| `microsoft/TRELLIS-image-large` | 3.3 GB | 16 GB is comfortable |
+| `microsoft/TRELLIS.2-4B` | 16.2 GB | 24 GB, per Microsoft; verified on A100/H100 |
 
-TRELLIS.2 depends on TRELLIS-1 — its `pipeline.json` points
-`sparse_structure_decoder` at `microsoft/TRELLIS-image-large`. Both therefore
-produce the same 64³ grid, so this worker handles either; only colour extraction
-differs. For TRELLIS.2 use a 24 GB GPU and reference both repos.
+`TORCH_CUDA_ARCH_LIST` targets sm_80/86/89/90 in both images, which covers the
+usual RunPod serverless GPUs. It does **not** include sm_120 (Blackwell) — for a
+5090-class worker, add `12.0` and rebuild.
 
 ## Licence
 
