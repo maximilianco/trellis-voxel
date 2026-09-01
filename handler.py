@@ -310,7 +310,8 @@ def _generate_v1(image, seed, resolution, want_colour, sparse_steps, slat_steps,
 
 
 def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg,
-                 pipeline_type=None):
+                 pipeline_type=None, want_mesh=False, decimation_target=20000,
+                 texture_size=1024):
     """TRELLIS.2: the O-Voxel output is already a voxel grid with materials.
 
     `run()` returns MeshWithVoxel, whose `coords`/`attrs` are the sparse voxel
@@ -341,6 +342,18 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
         preprocess_image=False,     # already cut out by the caller
         pipeline_type=kind,
     )[0]
+
+    if want_mesh:
+        # Surface rather than occupancy: what a rigger needs.
+        try:
+            glb = _mesh_glb(mesh, decimation_target, texture_size)
+            return {"coords": np.zeros((1, 3), np.int32), "colours": None,
+                    "opacity": None, "metallic": None, "roughness": None,
+                    "density": None, "glb_b64": glb,
+                    "source_resolution": resolution, "colour_source": "mesh"}
+        except Exception as exc:                     # noqa: BLE001
+            print(f"mesh export failed ({type(exc).__name__}: {exc}); "
+                  f"falling back to voxels", flush=True)
 
     coords = _to_numpy(mesh.coords, torch.int32).astype(np.int32)
     voxel_size = float(getattr(mesh, "voxel_size", 0) or 0)
@@ -377,6 +390,53 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
         "source_resolution": source_resolution,
         "colour_source": "pbr" if colours is not None else "none",
     }
+
+
+def _mesh_glb(mesh, decimation_target: int, texture_size: int) -> str | None:
+    """Export TRELLIS.2's mesh as a base64 glb.
+
+    The voxel path throws the mesh away, which is right for schematics and wrong
+    for anything that has to be rigged: an auto-rigger wants a surface with
+    vertices to weight, not an occupancy grid. Same generation, different tap.
+
+    decimation_target is deliberately exposed. A player model in Luanti is on
+    the order of a thousand triangles, and the example ships a million.
+    """
+    import base64
+    import io
+    import os
+    import tempfile
+
+    import o_voxel
+
+    glb = o_voxel.postprocess.to_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=mesh.layout,
+        voxel_size=mesh.voxel_size,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        decimation_target=decimation_target,
+        texture_size=texture_size,
+        remesh=True,
+        remesh_band=1,
+        remesh_project=0,
+        verbose=False,
+    )
+    try:
+        blob = glb.export(file_type="glb")
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8")
+    except Exception:
+        # Older trimesh wants a path rather than returning bytes.
+        handle, path = tempfile.mkstemp(suffix=".glb")
+        os.close(handle)
+        glb.export(path)
+        with open(path, "rb") as f:
+            blob = f.read()
+        os.unlink(path)
+    return base64.b64encode(blob).decode("ascii")
 
 
 def _gaussian_appearance(coords: np.ndarray, outputs, resolution: int):
@@ -506,6 +566,9 @@ def handler(event):
         extra = {}
         if version() == "2":
             extra["pipeline_type"] = payload.get("pipeline_type")
+            extra["want_mesh"] = bool(payload.get("want_mesh", False))
+            extra["decimation_target"] = int(payload.get("decimation_target", 20000))
+            extra["texture_size"] = int(payload.get("texture_size", 1024))
         generate = _generate_v2 if version() == "2" else _generate_v1
         result = generate(
             image, seed, resolution, want_colour,
@@ -530,6 +593,12 @@ def handler(event):
             "counts": {"voxels": int(len(coords))},
             "timings": timings,
         }
+        if result.get("glb_b64"):
+            payload_out["glb_b64"] = result["glb_b64"]
+            payload_out["encoding"] = "glb"
+            payload_out["counts"] = {"glb_bytes": len(result["glb_b64"])}
+            timings["pack"] = round(time.time() - mark, 2)
+            return payload_out
         fields = {"coords": coords.astype(np.int32),
                   "colours": result.get("colours"), "opacity": result.get("opacity"),
                   "metallic": result.get("metallic"), "roughness": result.get("roughness"),
