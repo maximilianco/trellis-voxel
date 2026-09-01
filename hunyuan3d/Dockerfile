@@ -55,17 +55,28 @@ ENV MAX_JOBS=4
 # 3.11 keeps torch 2.5.1/cu124 and every other pin here on wheels that exist
 # (pymeshlab 2022.2.post3 and open3d 0.18.0 both publish cp311).
 #
-# The X and GL libraries are bpy's. Importing Blender links against them even
-# headless, and a missing one surfaces at `import bpy` in a running job rather
-# than at build time.
+# The X, GL, Wayland, xkb and dbus libraries are Blender's, pulled in through
+# the bpy this file pins. The paint pipeline imports it, so a missing one does
+# not fail the build -- it fails at `import textureGenPipeline` on a running
+# worker. The first deployment of this image reported exactly that:
+#
+#   hy3dpaint: ImportError: libxkbcommon.so.0: cannot open shared object file
+#
+# with the shape half importing perfectly well, so shape ran and texture -- the
+# entire reason for choosing Hunyuan3D over TRELLIS -- could not. The set below
+# matches the rigger's, which is the same Blender with the same needs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-dev python3.11-venv git wget ninja-build \
         build-essential libglib2.0-0 libjpeg-dev libeigen3-dev \
-        libgl1 libegl1 libgles2 libx11-6 libxi6 libxxf86vm1 libxfixes3 \
-        libxrender1 libsm6 libice6 \
+        libgl1 libegl1 libgles2 libglu1-mesa \
+        libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxext6 libxt6 \
+        libxrandr2 libxinerama1 libxcursor1 libsm6 libice6 \
+        libxkbcommon0 libxkbcommon-x11-0 \
+        libwayland-client0 libwayland-cursor0 libwayland-egl1 \
+        libdbus-1-3 libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && python3.11 -m venv /opt/venv \
     && pip install --upgrade pip setuptools wheel \
