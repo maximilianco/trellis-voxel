@@ -11,7 +11,7 @@ no reason to rent a GPU to rescale a mesh.
 
 | stage | where | in / out | code |
 |---|---|---|---|
-| 1 shape + PBR texture | RunPod, 48 GB GPU | png -> textured glb | `deploy/hunyuan3d` |
+| 1 shape + PBR texture | RunPod, 24 GB GPU | png -> textured glb | `deploy/hunyuan3d` |
 | 2 auto-rig | RunPod, 24 GB GPU | glb -> rigged glb | `deploy/rig` |
 | 3 Luanti conversion | local | rigged glb -> player model | `lab/luanti_rig.py` |
 
@@ -59,8 +59,16 @@ the workstation has a 4 GB GPU, no Docker, single-digit GB free on C: and a
 
    | | GPU | model attachment | volume |
    |---|---|---|---|
-   | hunyuan3d | 48 GB **Ada or Ampere** (L40S/A6000/A100) | `tencent/Hunyuan3D-2.1` | required |
+   | hunyuan3d | 24 GB **Ada or Ampere** (A5000/4090/L4/A10G) | `tencent/Hunyuan3D-2.1` | required |
    | rig | 24 GB (A5000 verified) | none (weights baked) | shared with stage 1 |
+
+   **24 GB, not the 48 GB the upstream table implies.** Those figures are
+   10 GB for shape, 21 GB for texture, and 29 GB for the two *co-resident* —
+   and the handler never holds both, dropping the shape model and emptying the
+   cache before painting. Peak is therefore the texture stage's 21 GB. The
+   headroom on a 24 GB card is thin; if painting runs out of memory, lower
+   `max_views` (6 → 4) and `view_size` (512 → 384) before renting a bigger
+   card, or send `want_texture=false` for the 10 GB shape-only path.
 
    **Pick the GPU by architecture, not only by capacity.** RunPod's 48 GB tier
    now includes RTX PRO 6000 Blackwell, which is `sm_120`, and Hunyuan3D-2.1
@@ -75,26 +83,25 @@ the workstation has a 4 GB GPU, no Docker, single-digit GB free on C: and a
    which surfaces as jobs sitting in `IN_QUEUE` forever, looking for all the
    world like a capacity shortage. It is not; no worker can start. Rebuilding
    does not help either, because the torch pin is what upstream's two native
-   extensions compile against. Give that endpoint **L40S (Ada) or A6000
-   (Ampere)**.
+   extensions compile against. Give that endpoint an Ada or Ampere card.
 
    The rigger is free of this: torch 2.7/cu128 supports Blackwell, and its
    flash-attn is compiled with `sm_120` in the arch list so the card works
    there.
 
-   **The 48 GB is not padding.** Shape needs 10 GB and paint needs 21 GB, but
-   together they need 29 GB, so a 24 GB card can do either and not both. On a
-   24 GB card send `want_texture=false`, or accept the handler's two-pass path
-   which unloads the shape model first.
+   Ada or Ampere at 24 GB covers both endpoints, which is also where the
+   supply is; 48 GB only buys headroom on the texture stage.
 
    If the GHCR package is private, add a RunPod container-registry auth entry
    with your GitHub username and a PAT carrying `read:packages`.
 4. Add to `minetest.conf`, beside the existing TRELLIS keys:
 
    ```
-   runpod_api_key           = ...
-   runpod_hunyuan_endpoint  = ...
-   runpod_rig_endpoint      = ...
+   runpod_api_key              = ...
+   runpod_trellis_endpoint     = ...
+   runpod_hunyuan_endpoint     = ...
+   runpod_skintokens_endpoint  = ...
+   avatar_generator            = trellis | hunyuan3d   (optional default)
    ```
 
 5. Check both are alive before spending a generation on them:
@@ -111,7 +118,13 @@ the workstation has a 4 GB GPU, no Docker, single-digit GB free on C: and a
 
 ```
 python lab/avatar_pipeline.py "female dwarf blacksmith in a leather apron"
+python lab/avatar_pipeline.py "..." --generator trellis    # switch generator
 ```
+
+Which generator makes the mesh is a switch: `--generator`, else
+`avatar_generator` in minetest.conf, else whichever endpoint is configured,
+preferring hunyuan3d. Both return a glb and differ only in how the request is
+spelled, so each has a small adapter and the rest of the pipeline is unaware.
 
 Writes into `D:/blockgen-models/avatars/`: the source png, the Hunyuan3D glb,
 the rigged glb, and `<slug>_luanti.glb` plus a JSON report of the fit.
@@ -171,14 +184,29 @@ copying that would import the reference rig's convention along with the motion.
 
 ## Verified, and not
 
-Stage 3 is verified end-to-end on the existing TRELLIS avatar — structure (7
-joints, one 221-key timeline, weights summing to 1) and deformation, by
-evaluating the skinning at real frames: `mine` raises the arm, `sit` folds the
-legs and drops the height from 1.75 to 1.35. See `lab/luanti_bind.png` and
-`lab/luanti_anim.png`.
+**Stage 2 + stage 3 are verified against a real rig.** A TRELLIS glb went to
+the SkinTokens endpoint and came back with 52 joints named `bone_0`…`bone_51`
+and no animations — the "good rig, wrong rig" this pipeline is built around.
+After retargeting, the six bones are populated and left/right symmetric (arms
+17 each, legs 3 each), and evaluating the skinning at stock frames raises the
+arm for `mine` and folds the legs for `sit`, 1.75 down to 1.35. See
+`lab/skintokens_anim.png`.
 
-Stages 1 and 2 are **written but not built or run** — there is no Docker and no
-GPU here, and the vast.ai box is gone (connection refused). The Dockerfiles
-follow each project's documented install steps, but the first CI build is where
-they get tested. Both handlers answer `{"input":{"probe":true}}` precisely so
-the first thing you do to a new endpoint is cheap.
+Two things that first run caught, both worth knowing:
+
+- Joint positions must come from **composed node transforms**. Summing
+  translations put 36 of 52 joints in the head and none in the legs: in a bone
+  chain each translation is a length in its parent's *rotated* frame, so
+  ignoring rotation stacks the whole skeleton along one axis.
+- The rigger need not reach the fitted neck. SkinTokens stops at the base of
+  the skull, a few centimetres below the neck measured off the mesh, so the
+  Head bone gets nothing weighted to it unless the topmost centreline cluster
+  is promoted — otherwise the head rides the torso with a dead animation track.
+
+**Stage 1 is built but not yet run end-to-end.** The image builds and the
+handler answers `probe`, but no Hunyuan3D generation has completed here yet.
+
+**An inherent limit, not a defect:** Luanti's player skeleton has no elbow or
+knee, so collapsing 17 arm joints onto one rigid bone loses articulation and
+the shoulder deforms stiffly. The stock Minetest character has exactly the same
+constraint; it is the price of dropping into any game with the standard ranges.
