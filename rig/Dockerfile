@@ -32,7 +32,7 @@ FROM nvidia/cuda:${CUDA_TAG}
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0+PTX" \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0+PTX" \
     CUDA_HOME=/usr/local/cuda \
     SKINTOKENS_ROOT=/workspace/SkinTokens \
     PYTHONPATH=/workspace/SkinTokens \
@@ -40,6 +40,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# sm_120 is in the arch list because RunPod's 48 GB tier now serves RTX PRO 6000
+# Blackwell, and picking a GPU by capacity alone is how a worker ends up unable
+# to run the image. torch 2.7/cu128 supports Blackwell out of the box, but
+# flash-attn is compiled here, and compiled against 8.0-9.0 it would fail on
+# that card exactly as if torch itself were too old -- the endpoint sits in
+# IN_QUEUE while every worker fails its fitness check, which reads like a
+# capacity problem and is not one.
+#
+# Only this image can carry sm_120. The Hunyuan3D worker is on CUDA 12.4, whose
+# nvcc does not know the architecture at all, and its torch 2.5.1 stops at
+# sm_90; that endpoint has to be given Ada or Ampere instead.
 ENV MAX_JOBS=4
 
 # A venv, not the system interpreter: it keeps every extension build pointed at

@@ -59,8 +59,28 @@ the workstation has a 4 GB GPU, no Docker, single-digit GB free on C: and a
 
    | | GPU | model attachment | volume |
    |---|---|---|---|
-   | hunyuan3d | 48 GB (L40S/A6000/A100) | `tencent/Hunyuan3D-2.1` | required |
-   | rig | 24 GB | none (weights baked) | shared with stage 1 |
+   | hunyuan3d | 48 GB **Ada or Ampere** (L40S/A6000/A100) | `tencent/Hunyuan3D-2.1` | required |
+   | rig | 24 GB (A5000 verified) | none (weights baked) | shared with stage 1 |
+
+   **Pick the GPU by architecture, not only by capacity.** RunPod's 48 GB tier
+   now includes RTX PRO 6000 Blackwell, which is `sm_120`, and Hunyuan3D-2.1
+   pins torch 2.5.1/cu124 — that build stops at `sm_90`. Put the endpoint on a
+   Blackwell card and every worker fails its fitness check with
+
+   ```
+   CUDA error: no kernel image is available for execution on the device
+   ... sm_120 is not compatible with the current PyTorch installation
+   ```
+
+   which surfaces as jobs sitting in `IN_QUEUE` forever, looking for all the
+   world like a capacity shortage. It is not; no worker can start. Rebuilding
+   does not help either, because the torch pin is what upstream's two native
+   extensions compile against. Give that endpoint **L40S (Ada) or A6000
+   (Ampere)**.
+
+   The rigger is free of this: torch 2.7/cu128 supports Blackwell, and its
+   flash-attn is compiled with `sm_120` in the arch list so the card works
+   there.
 
    **The 48 GB is not padding.** Shape needs 10 GB and paint needs 21 GB, but
    together they need 29 GB, so a 24 GB card can do either and not both. On a
