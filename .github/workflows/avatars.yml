@@ -10,7 +10,7 @@
 # one exact build:
 #
 #   ghcr.io/<repo>:hunyuan3d        Hunyuan3D-2.1  torch 2.5.1/cu124, py3.10
-#   ghcr.io/<repo>:rig              SkinTokens     torch 2.7.0/cu128, py3.12
+#   ghcr.io/<repo>:rig              SkinTokens     torch 2.7.0/cu128, py3.11
 #   ghcr.io/<repo>:<worker>-<sha>   immutable, pin this on the endpoint
 #
 # There is deliberately no `:latest`. RunPod does not roll workers when a

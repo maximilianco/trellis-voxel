@@ -9,13 +9,24 @@
 # a skeleton to the mesh geometrically -- which works only for a humanoid in a
 # known pose, and this pipeline is meant to take whatever the generator makes.
 #
-# It cannot share the Hunyuan3D image. This is torch 2.7.0/cu128 and Python
-# 3.11+; Hunyuan3D-2.1 is torch 2.5.1/cu124 on Python 3.10. Ubuntu 24.04 is
-# used here purely because it ships a new enough Python.
+# It cannot share the Hunyuan3D image. This is torch 2.7.0/cu128 on Python
+# 3.11; Hunyuan3D-2.1 is torch 2.5.1/cu124 on Python 3.10.
+#
+# Python 3.11 EXACTLY, and not merely ">= 3.11" as upstream's README says.
+# requirements.txt pulls `bpy` -- Blender as an importable module -- and bpy
+# only publishes wheels for the one interpreter each Blender embeds: cp311 up
+# to bpy 5.0.1, then cp313 from 5.1. There has never been a cp312 wheel. So the
+# obvious reading of ">= 3.11", which is Ubuntu 24.04's stock 3.12, fails the
+# build outright with "No matching distribution found for bpy>=4.2" -- which is
+# precisely how this image failed the first time. 3.13 would also resolve (to
+# bpy 5.2.1) but puts flash-attn and torch on much less travelled wheels.
+#
+# Hence jammy plus deadsnakes rather than noble: 22.04 ships 3.10, and
+# deadsnakes is the reliable way to get 3.11 next to it.
 #
 # VRAM: 14 GB minimum upstream, so a 24 GB endpoint GPU is the sensible floor.
 # Unlike the Hunyuan3D worker there is no second stage to fit alongside it.
-ARG CUDA_TAG=12.8.1-cudnn-devel-ubuntu24.04
+ARG CUDA_TAG=12.8.1-cudnn-devel-ubuntu22.04
 FROM nvidia/cuda:${CUDA_TAG}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -31,15 +42,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV MAX_JOBS=4
 
-# 24.04 marks the system Python as externally managed (PEP 668), so a plain
-# `pip install` refuses. A venv is cleaner than --break-system-packages and
-# keeps the CUDA extension builds pointed at one interpreter.
+# A venv, not the system interpreter: it keeps every extension build pointed at
+# 3.11 rather than jammy's stock 3.10, without fighting the distro packages.
+#
+# The X and GL libraries are bpy's, not ours. Importing Blender links against
+# them even headless, and a missing one surfaces at `import bpy` inside the
+# rigger -- i.e. at job time on a running GPU worker, not at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-dev python3.12-venv python3-pip git wget \
-        ninja-build build-essential libgl1 libglib2.0-0 libegl1 libgles2 \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3.11-venv git wget \
+        ninja-build build-essential libglib2.0-0 \
+        libgl1 libegl1 libgles2 libx11-6 libxi6 libxxf86vm1 libxfixes3 \
+        libxrender1 libsm6 libice6 \
     && rm -rf /var/lib/apt/lists/* \
-    && python3.12 -m venv /opt/venv \
-    && pip install --upgrade pip setuptools wheel
+    && python3.11 -m venv /opt/venv \
+    && pip install --upgrade pip setuptools wheel \
+    && python -c "import sys; assert sys.version_info[:2]==(3,11), sys.version"
 
 # Torch first: flash-attn compiles against this exact build.
 RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
