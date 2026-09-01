@@ -54,7 +54,52 @@ def probe(event=None) -> dict:
     experiments = os.path.join(_ROOT, "experiments")
     report["weights"] = sorted(os.path.basename(p) for p in glob.glob(experiments + "/*")) \
         if os.path.isdir(experiments) else "missing"
+    report.update(_bpy_health())
     return report
+
+
+def _bpy_health() -> dict:
+    """Check Blender specifically, because demo.py hides it when it breaks.
+
+    demo.py runs Blender as a separate bpy_server process and polls it on
+    localhost. When that process dies at import -- a missing shared library is
+    the usual reason, since Blender links X, Wayland, xkb and dbus even
+    headless -- the parent reports only "bpy_server failed to start" and
+    discards the child's stderr. That is a job-time failure on a GPU worker
+    with the cause thrown away, so probe reproduces it here where the output
+    can be read.
+    """
+    out = {}
+    probe_import = subprocess.run(
+        ["python", "-c", "import bpy; print(bpy.app.version_string)"],
+        cwd=_ROOT, capture_output=True, text=True, timeout=300)
+    if probe_import.returncode == 0:
+        out["bpy"] = probe_import.stdout.strip()
+    else:
+        out["bpy"] = f"import failed: {probe_import.stderr.strip()[-600:]}"
+        # A linker failure names the library it could not find, which is the one
+        # thing that turns this from guesswork into an apt line.
+        for candidate in glob.glob("/opt/venv/lib/python3.11/site-packages/bpy/**/*.so",
+                                   recursive=True)[:1]:
+            linked = subprocess.run(["ldd", candidate], capture_output=True, text=True)
+            missing = [line.strip() for line in linked.stdout.splitlines()
+                       if "not found" in line]
+            out["bpy_missing_libraries"] = missing or "none reported by ldd"
+
+    # Start the server the way demo.py does. A healthy one never returns, so
+    # the timeout IS the success case; only an early exit is a failure, and
+    # then its stderr is the thing worth having.
+    server = os.path.join(_ROOT, "bpy_server.py")
+    if os.path.isfile(server):
+        try:
+            died = subprocess.run(["python", server], cwd=_ROOT, capture_output=True,
+                                  text=True, timeout=45)
+            out["bpy_server"] = {"exited": True, "returncode": died.returncode,
+                                 "stderr": died.stderr.strip()[-900:] or None,
+                                 "stdout": died.stdout.strip()[-400:] or None}
+        except subprocess.TimeoutExpired:
+            out["bpy_server"] = "still running after 45s (healthy)"
+    return out
 
 
 def _deliver(blob: bytes, job_id: str, prefer_volume: bool) -> dict:

@@ -45,17 +45,24 @@ ENV MAX_JOBS=4
 # A venv, not the system interpreter: it keeps every extension build pointed at
 # 3.11 rather than jammy's stock 3.10, without fighting the distro packages.
 #
-# The X and GL libraries are bpy's, not ours. Importing Blender links against
-# them even headless, and a missing one surfaces at `import bpy` inside the
-# rigger -- i.e. at job time on a running GPU worker, not at build time.
+# The X, GL, Wayland, xkb and dbus libraries are bpy's, not ours. Blender links
+# against them even in background mode, and a missing one does not fail the
+# build -- it fails at `import bpy` inside demo.py's bpy_server subprocess, on a
+# running GPU worker, where the parent only reports "bpy_server failed to
+# start" and throws the real error away. That is exactly how this image failed
+# the first time it ran a job, so the set below is deliberately generous.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-dev python3.11-venv git wget \
         ninja-build build-essential libglib2.0-0 \
-        libgl1 libegl1 libgles2 libx11-6 libxi6 libxxf86vm1 libxfixes3 \
-        libxrender1 libsm6 libice6 \
+        libgl1 libegl1 libgles2 libglu1-mesa \
+        libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxext6 libxt6 \
+        libxrandr2 libxinerama1 libxcursor1 libsm6 libice6 \
+        libxkbcommon0 libxkbcommon-x11-0 \
+        libwayland-client0 libwayland-cursor0 libwayland-egl1 \
+        libdbus-1-3 libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && python3.11 -m venv /opt/venv \
     && pip install --upgrade pip setuptools wheel \
@@ -69,7 +76,19 @@ WORKDIR /workspace
 RUN git clone https://github.com/VAST-AI-Research/SkinTokens.git ${SKINTOKENS_ROOT}
 
 RUN pip install -r ${SKINTOKENS_ROOT}/requirements.txt 2>&1 \
-        | tee /workspace/requirements_build.log | tail -5
+        | tee /workspace/requirements_build.log | tail -40
+
+# bpy is held to the 4.5 LTS line rather than left on upstream's `>=4.2`.
+#
+# That constraint was written before Blender 5.0 existed, so pip now resolves it
+# to bpy 5.0.1 -- a major version past anything SkinTokens was developed
+# against, and the release where a good deal of the Python API moved. Since the
+# failure being chased is bpy_server dying the instant it starts, running the
+# Blender the authors actually targeted removes one of the two candidate causes.
+# 4.5.13 is the newest cp311 build in the 4.x series.
+RUN pip install "bpy==4.5.13" \
+    && python -c "import bpy; print('bpy', bpy.app.version_string)"
+
 RUN pip install runpod huggingface_hub trimesh
 
 # flash-attn is what the Qwen3 backbone attends with. It takes most of the
