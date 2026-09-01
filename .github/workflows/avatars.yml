@@ -1,0 +1,130 @@
+# Build the avatar-pipeline workers on GitHub's runners and push to GHCR.
+#
+# Same reasoning as the TRELLIS workflow: the workstation has a 4 GB GPU, no
+# Docker, single-digit GB free on C: and a ~0.5 MB/s uplink, so building
+# locally is not on the table and renting a pod to build means paying for idle
+# GPU. GitHub Actions builds on their disk and pushes from their network.
+#
+# Two workers, two images, deliberately not shared -- they are pinned to
+# different torch/CUDA/Python lines and every compiled extension is linked to
+# one exact build:
+#
+#   ghcr.io/<repo>:hunyuan3d        Hunyuan3D-2.1  torch 2.5.1/cu124, py3.10
+#   ghcr.io/<repo>:rig              SkinTokens     torch 2.7.0/cu128, py3.12
+#   ghcr.io/<repo>:<worker>-<sha>   immutable, pin this on the endpoint
+#
+# There is deliberately no `:latest`. RunPod does not roll workers when a
+# moving tag changes, so an ambiguous tag turns "did my fix deploy?" into a
+# guess -- which already cost several cycles chasing stale TRELLIS workers.
+#
+# Copy this to .github/workflows/avatars.yml in the repo you give RunPod, with
+# deploy/hunyuan3d/ and deploy/rig/ alongside it.
+name: build avatar workers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hunyuan3d/**"
+      - "rig/**"
+      - ".github/workflows/avatars.yml"
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "Which worker to build"
+        default: "both"
+        type: choice
+        options: ["both", "hunyuan3d", "rig"]
+      bake_weights:
+        description: "Embed weights in the image (blank = per-worker default)"
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # A Hunyuan3D failure must not stop the rigger publishing, and the other
+      # way round: they are independent endpoints.
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJSON(inputs.worker == 'hunyuan3d' && '["hunyuan3d"]' || inputs.worker == 'rig' && '["rig"]' || '["hunyuan3d","rig"]') }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A default runner has ~14 GB free. Hunyuan3D pulls a CUDA devel base,
+      # torch, and two native extensions; the rigger adds flash-attn and baked
+      # weights. Clearing the preinstalled toolchains frees roughly 25 GB and
+      # takes about a minute.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Per-worker build settings
+        id: variant
+        run: |
+          if [ "${{ matrix.worker }}" = "hunyuan3d" ]; then
+            # Shape (3.3B) plus paint (2B) is far too large to embed; attach
+            # tencent/Hunyuan3D-2.1 to the endpoint as a RunPod model instead.
+            echo "bake_default=0" >> "$GITHUB_OUTPUT"
+          else
+            # TokenRig plus the FSQ-CVAE is small, and baking it means the
+            # rigger endpoint needs no network volume at all.
+            echo "bake_default=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.worker }}
+          file: ${{ matrix.worker }}/Dockerfile
+          # RunPod hosts are x86_64.
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ matrix.worker }}
+            ghcr.io/${{ github.repository }}:${{ matrix.worker }}-${{ github.sha }}
+          build-args: |
+            BAKE_WEIGHTS=${{ inputs.bake_weights || steps.variant.outputs.bake_default }}
+          # Registry layer cache scoped per worker: the native extensions take
+          # most of each build and only need recompiling when the dependency
+          # layers move. Sharing one scope between two different torch builds
+          # would thrash it.
+          cache-from: type=gha,scope=${{ matrix.worker }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.worker }}
+
+      - name: Image reference
+        run: |
+          echo "Pushed ghcr.io/${{ github.repository }}:${{ matrix.worker }}"
+          echo "Pin this on the endpoint for a reproducible worker:"
+          echo "  ghcr.io/${{ github.repository }}:${{ matrix.worker }}-${{ github.sha }}"
+          echo
+          if [ "${{ matrix.worker }}" = "hunyuan3d" ]; then
+            echo "Endpoint needs a 48 GB GPU for shape+texture in one pass"
+            echo "(29 GB combined). A 24 GB card must send want_texture=false."
+            echo "Attach tencent/Hunyuan3D-2.1 as a model, plus a network"
+            echo "volume: textured glb exceeds the inline response limit."
+          else
+            echo "Endpoint needs a 24 GB GPU (14 GB floor). Weights are baked,"
+            echo "so no network volume is required unless you want the shared"
+            echo "handoff directory with stage one."
+          fi
+          echo
+          echo "If the package is private, add a RunPod container registry auth"
+          echo "entry with your GitHub username and a PAT that has read:packages."
