@@ -30,7 +30,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0+PTX" \
     CUDA_HOME=/usr/local/cuda \
     HY3D_ROOT=/workspace/Hunyuan3D-2.1 \
-    PYTHONPATH=/workspace/Hunyuan3D-2.1:/workspace/Hunyuan3D-2.1/hy3dshape:/workspace/Hunyuan3D-2.1/hy3dpaint
+    PYTHONPATH=/workspace/Hunyuan3D-2.1:/workspace/Hunyuan3D-2.1/hy3dshape:/workspace/Hunyuan3D-2.1/hy3dpaint \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
 
 # Without pipefail a failed pip inside a `| tee | tail` pipeline exits 0 and the
 # broken image ships. This bit the TRELLIS build already.
@@ -40,13 +42,34 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # bare "Killed" rather than a compiler error.
 ENV MAX_JOBS=4
 
+# Python 3.11, not jammy's stock 3.10, and the reason is bpy.
+#
+# requirements.txt pins `bpy==4.0`, and that version no longer exists on PyPI:
+# every bpy still published is cp311 (4.2.0 through 5.0.1) or cp313 (5.1+).
+# There is no cp310 build left at all, so on 3.10 the pin is unsatisfiable and
+# pip fails with "Could not find a version that satisfies the requirement
+# bpy==4.0" -- the same class of failure the rigger image hit, for the same
+# reason: bpy ships one wheel per interpreter that Blender embeds, and old ones
+# get withdrawn.
+#
+# 3.11 keeps torch 2.5.1/cu124 and every other pin here on wheels that exist
+# (pymeshlab 2022.2.post3 and open3d 0.18.0 both publish cp311).
+#
+# The X and GL libraries are bpy's. Importing Blender links against them even
+# headless, and a missing one surfaces at `import bpy` in a running job rather
+# than at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.10 python3.10-dev python3-pip git wget ninja-build \
-        build-essential libgl1 libglib2.0-0 libegl1 libgles2 libjpeg-dev \
-        libeigen3-dev \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3.11-venv git wget ninja-build \
+        build-essential libglib2.0-0 libjpeg-dev libeigen3-dev \
+        libgl1 libegl1 libgles2 libx11-6 libxi6 libxxf86vm1 libxfixes3 \
+        libxrender1 libsm6 libice6 \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.10 /usr/bin/python \
-    && python -m pip install --upgrade pip setuptools wheel
+    && python3.11 -m venv /opt/venv \
+    && pip install --upgrade pip setuptools wheel \
+    && python -c "import sys; assert sys.version_info[:2]==(3,11), sys.version"
 
 # Torch first: custom_rasterizer and the mesh painter both compile against it.
 RUN pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
@@ -55,9 +78,35 @@ RUN pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
 WORKDIR /workspace
 RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git ${HY3D_ROOT}
 
-# Upstream's own requirements, then what a serverless worker needs on top.
+# Upstream's requirements need two edits before they will resolve at all.
+#
+#   bpy==4.0        withdrawn from PyPI; 4.2.0 is the oldest still published
+#                   and is cp311, which is why this image is on 3.11.
+#   --extra-index-url
+#                   the file points pip at Tencent and Aliyun mirrors. From a
+#                   GitHub runner those are slow at best, and an extra index is
+#                   a dependency-confusion foothold besides: any name resolved
+#                   there outranks nothing and silently shadows PyPI. Everything
+#                   pinned here exists on PyPI proper.
+#
+# Edited with sed rather than by vendoring a copy of the file, so upstream's
+# pins keep flowing through and only the two broken lines are overridden.
+RUN sed -i -e 's|^--extra-index-url.*$||' \
+           -e 's|^bpy==4\.0$|bpy==4.2.0|' ${HY3D_ROOT}/requirements.txt \
+    && grep -nE 'bpy|extra-index' ${HY3D_ROOT}/requirements.txt || true
+
+# basicsr is sdist-only and its setup.py imports torch, so with PEP 517 build
+# isolation -- where torch does not exist -- it dies with "No module named
+# 'torch'". Installing it first, unisolated, means the pin is already satisfied
+# when the requirements file asks for it.
+RUN pip install --no-build-isolation basicsr==1.4.2 2>&1 \
+        | tee /workspace/basicsr_build.log | tail -20
+
+# tail -40, not -5. The first failure here was a one-line pip resolver error
+# that the previous `tail -5` truncated away entirely, which turned a plainly
+# diagnosable build into a guess. The full log stays in the image regardless.
 RUN pip install -r ${HY3D_ROOT}/requirements.txt 2>&1 \
-        | tee /workspace/requirements_build.log | tail -5
+        | tee /workspace/requirements_build.log | tail -40
 RUN pip install runpod huggingface_hub accelerate onnxruntime
 
 # The two native extensions. These are NOT optional: custom_rasterizer is what
