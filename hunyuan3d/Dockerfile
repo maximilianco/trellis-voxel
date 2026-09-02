@@ -118,7 +118,13 @@ RUN pip install --no-build-isolation basicsr==1.4.2 2>&1 \
 # diagnosable build into a guess. The full log stays in the image regardless.
 RUN pip install -r ${HY3D_ROOT}/requirements.txt 2>&1 \
         | tee /workspace/requirements_build.log | tail -40
-RUN pip install runpod huggingface_hub accelerate onnxruntime
+# hf_xet is not optional here even though HuggingFace treats it as such. The
+# worker log reports
+#   Xet Storage is enabled for this repo, but the 'hf_xet' package is not
+#   installed. Falling back to regular HTTP download.
+# and this endpoint pulls 15 GB of weights on a cold start, so the fallback is
+# paid every time a worker scales from zero.
+RUN pip install runpod huggingface_hub[hf_xet] hf_xet accelerate onnxruntime
 
 # The two native extensions. These are NOT optional: custom_rasterizer is what
 # projects the painted views back onto the mesh, and without the mesh painter

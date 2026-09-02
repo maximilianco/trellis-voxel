@@ -41,11 +41,44 @@ _SHAPE = None
 _PAINT = None
 
 
+def _persist_hy3d_cache():
+    """Point Hunyuan3D's own cache at the volume, if there is one.
+
+    Setting HF_HOME is not enough. hy3dshape does not fetch through the plain
+    HuggingFace cache -- the worker log says so directly:
+
+        Try to load model from local path:
+          /root/.cache/hy3dgen/tencent/Hunyuan3D-2.1/hunyuan3d-dit-v2-1
+        Model path not exists, try to download from huggingface
+
+    That path is fixed under the home directory, so without this the 15 GB of
+    weights land on container disk and every cold worker downloads them again,
+    however large a network volume is attached.
+    """
+    if not os.path.isdir("/runpod-volume"):
+        return
+    target = "/runpod-volume/hy3dgen"
+    link = os.path.expanduser("~/.cache/hy3dgen")
+    try:
+        os.makedirs(target, exist_ok=True)
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if os.path.islink(link):
+            return
+        if os.path.isdir(link):
+            # Real directory already holding weights: leave it be rather than
+            # delete something a running job may be reading.
+            return
+        os.symlink(target, link)
+    except OSError as exc:
+        print(f"could not persist the hy3dgen cache: {exc}", flush=True)
+
+
 def model_path() -> str:
     """Prefer the host-side model cache when the endpoint has one attached."""
     if os.path.isdir(_RUNPOD_CACHE):
         os.environ.setdefault("HF_HOME", _RUNPOD_CACHE)
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _RUNPOD_CACHE)
+    _persist_hy3d_cache()
     baked = "/workspace/weights"
     if os.path.isdir(baked) and os.listdir(baked):
         return baked
