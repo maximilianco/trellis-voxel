@@ -222,5 +222,15 @@ RUN if [ "$BAKE_WEIGHTS" = "1" ]; then \
         echo "weights not baked; attach the model to the endpoint instead" ; \
     fi
 
+# pkg_resources is imported by the paint pipeline's dependencies while the
+# pipeline is being constructed. Recent setuptools dropped it, so the
+# `pip install --upgrade setuptools` at the top of this file removed a module
+# the paint stage needs -- and because it is imported lazily, the miss only
+# surfaced after the shape model had already run for two minutes.
+#
+# Pinned last, after every other install, so nothing pulled in by a
+# requirements file can quietly upgrade it back out again.
+RUN pip install "setuptools<81"     && python -c "import pkg_resources; print('pkg_resources importable')"
+
 COPY handler.py /workspace/handler.py
 CMD ["python", "-u", "/workspace/handler.py"]

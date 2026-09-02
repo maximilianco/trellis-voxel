@@ -148,7 +148,7 @@ def paint_pipeline(view_size: int = 512, max_views: int = 6):
     return _PAINT
 
 
-def probe(event=None) -> dict:
+def probe(event=None, deep: bool = False) -> dict:
     """Report what the worker actually has, over the API.
 
     The machine driving this endpoint has a 4 GB GPU and no Docker, so
@@ -196,6 +196,21 @@ def probe(event=None) -> dict:
         report["paint_config"] = _resolve_config_paths(config, verbose=False)
     except Exception as exc:  # noqa: BLE001
         report["paint_config"] = f"{type(exc).__name__}: {exc}"
+
+    # Constructing the config was still not enough: the next failure was a
+    # missing module imported while the *pipeline* was being built, which
+    # again cost a shape generation to reach. deep=True builds the pipeline
+    # itself. That loads weights and takes minutes, but it is the only check
+    # that exercises what a real job exercises, and it costs no generation.
+    if deep:
+        started = time.time()
+        try:
+            paint_pipeline()
+            report["paint_pipeline"] = f"constructed in {time.time()-started:.0f}s"
+        except Exception as exc:  # noqa: BLE001
+            report["paint_pipeline"] = (f"{type(exc).__name__}: {exc}
+"
+                                        + traceback.format_exc()[-1500:])
     return report
 
 
@@ -246,7 +261,7 @@ def handler(event):
     timings = {}
 
     if payload.get("probe"):
-        return {"probe": probe()}
+        return {"probe": probe(deep=bool(payload.get("deep")))}
 
     try:
         import torch
