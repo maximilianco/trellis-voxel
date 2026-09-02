@@ -421,7 +421,20 @@ def _mesh_glb(mesh, decimation_target: int, texture_size: int) -> str | None:
         texture_size=texture_size,
         remesh=True,
         remesh_band=1,
-        remesh_project=0,
+        # Upstream's default, and not to be turned off again.
+        #
+        # remesh_project is how hard the remeshed surface is pulled back onto
+        # the original geometry. This passed 0 -- projection disabled entirely --
+        # which was written without checking the default rather than chosen, and
+        # leaves a rebuilt surface that was never fitted to the shape it stands
+        # for. It fails exactly where surfaces are thin or narrowly separated:
+        # holes through the crotch and between the legs, holes in the eye
+        # sockets, and arms that came out as flat sheets 1.56 times deeper than
+        # they are tall instead of limbs.
+        #
+        # Those artifacts were blamed in turn on the decimation budget, on face
+        # winding, and on the rigging. All three were wrong; it was this.
+        remesh_project=0.9,
         verbose=False,
     )
     try:
