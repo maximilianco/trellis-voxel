@@ -208,8 +208,7 @@ def probe(event=None, deep: bool = False) -> dict:
             paint_pipeline()
             report["paint_pipeline"] = f"constructed in {time.time()-started:.0f}s"
         except Exception as exc:  # noqa: BLE001
-            report["paint_pipeline"] = (f"{type(exc).__name__}: {exc}
-"
+            report["paint_pipeline"] = (f"{type(exc).__name__}: {exc} | "
                                         + traceback.format_exc()[-1500:])
     return report
 
