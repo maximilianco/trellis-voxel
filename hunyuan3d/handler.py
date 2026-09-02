@@ -24,8 +24,10 @@ Two things bite on this endpoint and both are handled below.
 from __future__ import annotations
 
 import base64
+import importlib
 import io
 import os
+import sys
 import time
 import traceback
 
@@ -138,12 +140,75 @@ def _resolve_config_paths(config, verbose: bool = True) -> dict:
     return resolved
 
 
+def _prepare_dynamic_modules() -> dict:
+    """Make diffusers see a dynamic module it wrote a moment ago.
+
+    The paint model declares its unet in model_index.json as
+
+        "unet": ["modules", "UNet2p5DConditionModel"]
+
+    so diffusers copies modules.py out of the model folder into
+    HF_MODULES_CACHE/diffusers_modules/local/ and immediately imports it as
+    diffusers_modules.local.modules. That import is what failed:
+
+        ModuleNotFoundError: No module named diffusers_modules.local.modules
+
+    The file is genuinely there. The package diffusers_modules.local has
+    already been imported by that point, because the pipeline class is loaded
+    the same way moments earlier, and Python caches a directory listing per
+    package with one-second mtime granularity. A file written and imported
+    inside the same second is therefore invisible to the finder, which is the
+    documented reason importlib.invalidate_caches exists. diffusers calls
+    import_module here without it.
+
+    So every dynamic import is made to invalidate the cache first. The shim is
+    idempotent and does nothing when the file was already visible.
+    """
+    facts = {}
+    try:
+        from diffusers.utils import dynamic_modules_utils as dmu
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    cache = str(dmu.HF_MODULES_CACHE)
+    facts["hf_home"] = os.environ.get("HF_HOME", "unset")
+    facts["hf_modules_cache"] = cache
+    facts["on_sys_path"] = cache in sys.path
+    if not getattr(dmu.get_class_in_module, "_invalidates_caches", False):
+        original = dmu.get_class_in_module
+
+        def get_class_in_module(class_name, module_path):
+            importlib.invalidate_caches()
+            return original(class_name, module_path)
+
+        get_class_in_module._invalidates_caches = True
+        dmu.get_class_in_module = get_class_in_module
+        facts["shim"] = "installed"
+    else:
+        facts["shim"] = "already installed"
+    return facts
+
+
+def _dynamic_module_listing() -> dict:
+    """What diffusers actually wrote, for when the shim is not the answer."""
+    try:
+        from diffusers.utils import dynamic_modules_utils as dmu
+        base = os.path.join(str(dmu.HF_MODULES_CACHE), "diffusers_modules")
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    listing = {}
+    for root, _dirs, files in os.walk(base):
+        rel = os.path.relpath(root, base)
+        listing[rel] = sorted(files)[:20]
+    return listing or {"note": f"nothing under {base}"}
+
+
 def paint_pipeline(view_size: int = 512, max_views: int = 6):
     global _PAINT
     if _PAINT is None:
         from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
         config = Hunyuan3DPaintConfig(max_num_view=max_views, resolution=view_size)
         _resolve_config_paths(config)
+        _prepare_dynamic_modules()
         _PAINT = Hunyuan3DPaintPipeline(config)
     return _PAINT
 
@@ -202,6 +267,7 @@ def probe(event=None, deep: bool = False) -> dict:
     # again cost a shape generation to reach. deep=True builds the pipeline
     # itself. That loads weights and takes minutes, but it is the only check
     # that exercises what a real job exercises, and it costs no generation.
+    report["dynamic_modules"] = _prepare_dynamic_modules()
     if deep:
         started = time.time()
         try:
@@ -210,6 +276,7 @@ def probe(event=None, deep: bool = False) -> dict:
         except Exception as exc:  # noqa: BLE001
             report["paint_pipeline"] = (f"{type(exc).__name__}: {exc} | "
                                         + traceback.format_exc()[-1500:])
+            report["dynamic_module_listing"] = _dynamic_module_listing()
     return report
 
 
