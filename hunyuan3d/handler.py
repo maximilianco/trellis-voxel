@@ -220,7 +220,8 @@ def probe(event=None, deep: bool = False) -> dict:
     `docker run --gpus` is not an available way to find out whether the image
     works. It has to be askable remotely.
     """
-    report = {"model_path": model_path(),
+    report = {"build": os.environ.get("GIT_SHA", "unknown")[:7],
+              "model_path": model_path(),
               "runpod_cache": os.path.isdir(_RUNPOD_CACHE),
               "inline_limit_bytes": _INLINE_LIMIT}
     try:

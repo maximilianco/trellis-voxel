@@ -102,6 +102,7 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ matrix.worker }}-${{ github.sha }}
           build-args: |
             BAKE_WEIGHTS=${{ inputs.bake_weights || steps.variant.outputs.bake_default }}
+            GIT_SHA=${{ github.sha }}
           # Registry layer cache scoped per worker: the native extensions take
           # most of each build and only need recompiling when the dependency
           # layers move. Sharing one scope between two different torch builds

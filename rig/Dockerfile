@@ -128,5 +128,13 @@ RUN if [ "$BAKE_WEIGHTS" = "1" ]; then \
         echo "weights not baked; attach ${SKINTOKENS_REPO} to the endpoint" ; \
     fi
 
+# Which commit built this image. Debugging the paint stage cost a full round
+# of wrong conclusions because the endpoint was serving an image older than the
+# one being reasoned about, and nothing in the response said so. The probe
+# reports this, so "is the deployed image the one I just pushed" is a fact
+# rather than an assumption.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 COPY handler.py /workspace/handler.py
 CMD ["python", "-u", "/workspace/handler.py"]
