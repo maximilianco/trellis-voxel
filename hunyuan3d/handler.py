@@ -24,6 +24,7 @@ Two things bite on this endpoint and both are handled below.
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import os
 import time
@@ -94,12 +95,43 @@ def shape_pipeline():
     return _SHAPE
 
 
+@contextlib.contextmanager
+def _in_paint_dir():
+    """Run the paint stage from hy3dpaint/, because its paths are relative.
+
+    The upscaler is loaded as 'ckpt/RealESRGAN_x4plus.pth' -- no anchor, so it
+    resolves against the working directory. The weights are on disk exactly
+    where upstream's install instructions put them, and the handler runs from
+    /workspace, so the open fails:
+
+        FileNotFoundError: 'ckpt/RealESRGAN_x4plus.pth'
+
+    after two minutes of shape generation. Symlinking that one file would fix
+    that one line; upstream's demo runs from inside hy3dpaint and its configs
+    and weights are addressed the same way throughout, so the directory is the
+    thing to match rather than the file.
+
+    A serverless worker handles one job at a time, so a process-wide chdir is
+    safe here in a way it would not be under concurrency.
+    """
+    root = os.path.join(os.environ.get("HY3D_ROOT", "/workspace/Hunyuan3D-2.1"),
+                        "hy3dpaint")
+    previous = os.getcwd()
+    try:
+        if os.path.isdir(root):
+            os.chdir(root)
+        yield
+    finally:
+        os.chdir(previous)
+
+
 def paint_pipeline(view_size: int = 512, max_views: int = 6):
     global _PAINT
     if _PAINT is None:
         from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
         config = Hunyuan3DPaintConfig(max_num_view=max_views, resolution=view_size)
-        _PAINT = Hunyuan3DPaintPipeline(config)
+        with _in_paint_dir():
+            _PAINT = Hunyuan3DPaintPipeline(config)
     return _PAINT
 
 
@@ -250,10 +282,11 @@ def handler(event):
             handle, untextured = tempfile.mkstemp(suffix=".obj")
             os.close(handle)
             mesh.export(untextured)
-            painted = paint_pipeline(
-                view_size=int(payload.get("view_size", 512)),
-                max_views=int(payload.get("max_views", 6)),
-            )(mesh_path=untextured, image_path=image)
+            with _in_paint_dir():
+                painted = paint_pipeline(
+                    view_size=int(payload.get("view_size", 512)),
+                    max_views=int(payload.get("max_views", 6)),
+                )(mesh_path=untextured, image_path=image)
             timings["paint"] = round(time.time() - mark, 2)
             mesh = trimesh.load(painted, force="scene") if isinstance(painted, str) else painted
 
