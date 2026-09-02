@@ -24,7 +24,6 @@ Two things bite on this endpoint and both are handled below.
 from __future__ import annotations
 
 import base64
-import contextlib
 import io
 import os
 import time
@@ -95,34 +94,48 @@ def shape_pipeline():
     return _SHAPE
 
 
-@contextlib.contextmanager
-def _in_paint_dir():
-    """Run the paint stage from hy3dpaint/, because its paths are relative.
+def _resolve_config_paths(config, verbose: bool = True) -> dict:
+    """Rewrite the paint config's relative paths to absolute ones.
 
-    The upscaler is loaded as 'ckpt/RealESRGAN_x4plus.pth' -- no anchor, so it
-    resolves against the working directory. The weights are on disk exactly
-    where upstream's install instructions put them, and the handler runs from
-    /workspace, so the open fails:
+    Upstream disagrees with itself about what its relative paths are relative
+    to. The multiview config is spelled
 
-        FileNotFoundError: 'ckpt/RealESRGAN_x4plus.pth'
+        hy3dpaint/cfgs/hunyuan-paint-pbr.yaml     (from the repo root)
 
-    after two minutes of shape generation. Symlinking that one file would fix
-    that one line; upstream's demo runs from inside hy3dpaint and its configs
-    and weights are addressed the same way throughout, so the directory is the
-    thing to match rather than the file.
+    and the upscaler is spelled
 
-    A serverless worker handles one job at a time, so a process-wide chdir is
-    safe here in a way it would not be under concurrency.
+        ckpt/RealESRGAN_x4plus.pth                (from inside hy3dpaint)
+
+    No working directory satisfies both, so chdir cannot fix this -- it only
+    chooses which of the two fails. Each relative path is instead tried against
+    both bases and set to whichever actually exists, which leaves correct paths
+    untouched and does not depend on where the worker runs.
     """
-    root = os.path.join(os.environ.get("HY3D_ROOT", "/workspace/Hunyuan3D-2.1"),
-                        "hy3dpaint")
-    previous = os.getcwd()
-    try:
-        if os.path.isdir(root):
-            os.chdir(root)
-        yield
-    finally:
-        os.chdir(previous)
+    root = os.environ.get("HY3D_ROOT", "/workspace/Hunyuan3D-2.1")
+    bases = (root, os.path.join(root, "hy3dpaint"))
+    resolved = {}
+    fields = vars(config) if hasattr(config, "__dict__") else {}
+    for attr, value in list(fields.items()):
+        if not isinstance(value, str) or not value or os.path.isabs(value):
+            continue
+        for base in bases:
+            candidate = os.path.join(base, value)
+            if os.path.exists(candidate):
+                setattr(config, attr, candidate)
+                resolved[attr] = candidate
+                if verbose:
+                    print(f"  paint config: {attr} -> {candidate}", flush=True)
+                break
+        else:
+            # Existence is the filter, so anything left here is either not a
+            # path at all ("cuda") or genuinely missing. Report the ones that
+            # look like files so a missing weight is visible in the log rather
+            # than two minutes into the next job.
+            if "/" in value or value.endswith((".yaml", ".yml", ".pth", ".ckpt")):
+                resolved[attr] = f"UNRESOLVED: {value}"
+                if verbose:
+                    print(f"  paint config: {attr} UNRESOLVED {value}", flush=True)
+    return resolved
 
 
 def paint_pipeline(view_size: int = 512, max_views: int = 6):
@@ -130,8 +143,8 @@ def paint_pipeline(view_size: int = 512, max_views: int = 6):
     if _PAINT is None:
         from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
         config = Hunyuan3DPaintConfig(max_num_view=max_views, resolution=view_size)
-        with _in_paint_dir():
-            _PAINT = Hunyuan3DPaintPipeline(config)
+        _resolve_config_paths(config)
+        _PAINT = Hunyuan3DPaintPipeline(config)
     return _PAINT
 
 
@@ -171,6 +184,18 @@ def probe(event=None) -> dict:
             report[name] = "importable"
         except Exception as exc:  # noqa: BLE001
             report[name] = f"{type(exc).__name__}: {exc}"
+
+    # "importable" turned out not to mean "will run": the paint stage failed
+    # twice on data files it opens by relative path, each time only after two
+    # minutes of shape generation. Building the config here is cheap -- it
+    # loads no weights -- and says exactly which paths resolve, so that class
+    # of failure is answerable from a probe instead of a job.
+    try:
+        from textureGenPipeline import Hunyuan3DPaintConfig
+        config = Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
+        report["paint_config"] = _resolve_config_paths(config, verbose=False)
+    except Exception as exc:  # noqa: BLE001
+        report["paint_config"] = f"{type(exc).__name__}: {exc}"
     return report
 
 
@@ -282,11 +307,10 @@ def handler(event):
             handle, untextured = tempfile.mkstemp(suffix=".obj")
             os.close(handle)
             mesh.export(untextured)
-            with _in_paint_dir():
-                painted = paint_pipeline(
-                    view_size=int(payload.get("view_size", 512)),
-                    max_views=int(payload.get("max_views", 6)),
-                )(mesh_path=untextured, image_path=image)
+            painted = paint_pipeline(
+                view_size=int(payload.get("view_size", 512)),
+                max_views=int(payload.get("max_views", 6)),
+            )(mesh_path=untextured, image_path=image)
             timings["paint"] = round(time.time() - mark, 2)
             mesh = trimesh.load(painted, force="scene") if isinstance(painted, str) else painted
 
