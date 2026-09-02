@@ -22,6 +22,9 @@ Input:
     {"image_b64": "...", "seed": 0, "resolution": 64,
      "sparse_steps": 12, "slat_steps": 12, "cfg": 7.5,
      "want_colour": true, "remove_background": true}
+  mesh path (TRELLIS.2), all optional:
+    {"want_mesh": true, "decimation_target": 20000, "texture_size": 1024,
+     "remesh": true, "remesh_band": 1.0, "remesh_project": 0.9}
   or {"image_url": "https://..."}
 
 Output:
@@ -311,7 +314,8 @@ def _generate_v1(image, seed, resolution, want_colour, sparse_steps, slat_steps,
 
 def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps, cfg,
                  pipeline_type=None, want_mesh=False, decimation_target=20000,
-                 texture_size=1024):
+                 texture_size=1024, remesh=True, remesh_band=1.0,
+                 remesh_project=0.9):
     """TRELLIS.2: the O-Voxel output is already a voxel grid with materials.
 
     `run()` returns MeshWithVoxel, whose `coords`/`attrs` are the sparse voxel
@@ -346,7 +350,8 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
     if want_mesh:
         # Surface rather than occupancy: what a rigger needs.
         try:
-            glb = _mesh_glb(mesh, decimation_target, texture_size)
+            glb = _mesh_glb(mesh, decimation_target, texture_size,
+                            remesh, remesh_band, remesh_project)
             return {"coords": np.zeros((1, 3), np.int32), "colours": None,
                     "opacity": None, "metallic": None, "roughness": None,
                     "density": None, "glb_b64": glb,
@@ -392,7 +397,9 @@ def _generate_v2(image, seed, resolution, want_colour, sparse_steps, slat_steps,
     }
 
 
-def _mesh_glb(mesh, decimation_target: int, texture_size: int) -> str | None:
+def _mesh_glb(mesh, decimation_target: int, texture_size: int,
+              remesh: bool = True, remesh_band: float = 1.0,
+              remesh_project: float = 0.9) -> str | None:
     """Export TRELLIS.2's mesh as a base64 glb.
 
     The voxel path throws the mesh away, which is right for schematics and wrong
@@ -401,6 +408,20 @@ def _mesh_glb(mesh, decimation_target: int, texture_size: int) -> str | None:
 
     decimation_target is deliberately exposed. A player model in Luanti is on
     the order of a thousand triangles, and the example ships a million.
+
+    So are the remesh parameters, and for a harder-won reason. remesh_project
+    was hardcoded to 0 here -- upstream defaults it to 0.9 -- which disables the
+    step that pulls the remeshed surface back onto the original geometry, so the
+    surface is rebuilt and never fitted to the shape it stands for. It fails
+    where surfaces are thin or narrowly separated, which is every avatar defect
+    seen: holes through the crotch and between the legs, holes in the eye
+    sockets, arms measuring 1.56 times deeper than tall.
+
+    Being invisible from outside is what made it expensive. Testing the suspect
+    meant rebuilding an image, so it was not tested, and the artifacts were
+    attributed in turn to the decimation budget, to face winding and to the
+    rigging -- each with real work behind it. As parameters, the comparison is
+    two API calls.
     """
     import base64
     import io
@@ -419,22 +440,9 @@ def _mesh_glb(mesh, decimation_target: int, texture_size: int) -> str | None:
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=decimation_target,
         texture_size=texture_size,
-        remesh=True,
-        remesh_band=1,
-        # Upstream's default, and not to be turned off again.
-        #
-        # remesh_project is how hard the remeshed surface is pulled back onto
-        # the original geometry. This passed 0 -- projection disabled entirely --
-        # which was written without checking the default rather than chosen, and
-        # leaves a rebuilt surface that was never fitted to the shape it stands
-        # for. It fails exactly where surfaces are thin or narrowly separated:
-        # holes through the crotch and between the legs, holes in the eye
-        # sockets, and arms that came out as flat sheets 1.56 times deeper than
-        # they are tall instead of limbs.
-        #
-        # Those artifacts were blamed in turn on the decimation budget, on face
-        # winding, and on the rigging. All three were wrong; it was this.
-        remesh_project=0.9,
+        remesh=remesh,
+        remesh_band=remesh_band,
+        remesh_project=remesh_project,
         verbose=False,
     )
     try:
@@ -582,6 +590,22 @@ def handler(event):
             extra["want_mesh"] = bool(payload.get("want_mesh", False))
             extra["decimation_target"] = int(payload.get("decimation_target", 20000))
             extra["texture_size"] = int(payload.get("texture_size", 1024))
+            # Exposed, and defaulted to upstream's values rather than to
+            # whatever was here before. remesh_project had been hardcoded to 0
+            # -- projection off, so the remeshed surface was never fitted to the
+            # geometry it stands for -- and it fails exactly where surfaces are
+            # thin or narrowly separated: holes through the crotch and between
+            # the legs, holes in the eye sockets, arms coming out as flat sheets
+            # 1.56 times deeper than tall rather than limbs.
+            #
+            # The reason these are parameters now is that the value was
+            # invisible from outside. The defects were blamed in turn on the
+            # decimation budget, on face winding and on the rigging, and each
+            # got real work, because testing the actual suspect meant rebuilding
+            # an image. Two API calls settle it instead.
+            extra["remesh"] = bool(payload.get("remesh", True))
+            extra["remesh_band"] = float(payload.get("remesh_band", 1.0))
+            extra["remesh_project"] = float(payload.get("remesh_project", 0.9))
         generate = _generate_v2 if version() == "2" else _generate_v1
         result = generate(
             image, seed, resolution, want_colour,
