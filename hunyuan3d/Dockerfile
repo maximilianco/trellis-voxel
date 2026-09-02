@@ -163,9 +163,32 @@ RUN cd ${HY3D_ROOT}/hy3dpaint/custom_rasterizer \
     && pip install --no-build-isolation -e . 2>&1 \
        | tee /workspace/rasterizer_build.log | tail -5
 
+# The mesh inpainter, compiled against THIS interpreter rather than by running
+# upstream's script as-is.
+#
+# compile_mesh_painter.sh names the output with `python3-config
+# --extension-suffix`. A venv does not ship python3-config, so that resolves to
+# /usr/bin/python3-config -- jammy's 3.10 -- while everything here runs 3.11.
+# The extension builds perfectly and is then named ...cpython-310...so, which
+# 3.11 will not import. Upstream swallows the failure:
+#
+#   InPaint Function CAN NOT BE Imported!!!
+#
+# and carries on, so the worker starts, generates a shape, and only the
+# inpainting quietly does not exist. Taking the suffix from the running
+# interpreter is the whole fix; the compile line is otherwise theirs.
 RUN cd ${HY3D_ROOT}/hy3dpaint/DifferentiableRenderer \
-    && bash compile_mesh_painter.sh 2>&1 \
-       | tee /workspace/painter_build.log | tail -5
+    && SUFFIX=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))") \
+    && echo "building mesh_inpaint_processor${SUFFIX}" \
+    && c++ -O3 -Wall -shared -std=c++11 -fPIC $(python -m pybind11 --includes) \
+         mesh_inpaint_processor.cpp -o "mesh_inpaint_processor${SUFFIX}" 2>&1 \
+       | tee /workspace/painter_build.log | tail -5 \
+    && ls -la mesh_inpaint_processor*.so
+
+# Assert it imports. Upstream catches the failure and prints a warning, so
+# without this the only symptom is inpainting silently missing from every job.
+RUN cd ${HY3D_ROOT}/hy3dpaint/DifferentiableRenderer \
+    && python -c "import mesh_inpaint_processor; print('mesh_inpaint_processor OK')"
 
 # The paint pipeline upscales its generated views with RealESRGAN and expects
 # the checkpoint on disk at a fixed path. Fetching it at runtime means every
