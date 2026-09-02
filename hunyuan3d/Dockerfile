@@ -113,6 +113,36 @@ RUN sed -i -e 's|^--extra-index-url.*$||' \
 RUN pip install --no-build-isolation basicsr==1.4.2 2>&1 \
         | tee /workspace/basicsr_build.log | tail -20
 
+# basicsr 1.4.2 imports torchvision.transforms.functional_tensor, which
+# torchvision removed in 0.17; this image is pinned to 0.20.1, so the module has
+# not existed for several releases. It surfaces only when the paint pipeline
+# reaches RealESRGAN -- which imports basicsr to upscale its generated views --
+# so the job runs for two minutes, completes shape, and then dies:
+#
+#   ModuleNotFoundError: No module named 'torchvision.transforms.functional_tensor'
+#
+# A shim beats editing basicsr's source: the same removal breaks realesrgan and
+# anything else of that vintage, and a patched file would need re-patching if the
+# pin moves. functional_tensor's public surface was folded into functional, so
+# re-exporting it is what upstream did.
+RUN python - <<'PY'
+import os, torchvision
+path = os.path.join(os.path.dirname(torchvision.__file__), "transforms",
+                    "functional_tensor.py")
+if not os.path.exists(path):
+    with open(path, "w") as f:
+        f.write("# Shim: torchvision removed this module in 0.17 and basicsr\n"
+                "# still imports it. Its contents moved into functional.\n"
+                "from torchvision.transforms.functional import *  # noqa: F401,F403\n"
+                "from torchvision.transforms.functional import (  # noqa: F401\n"
+                "    rgb_to_grayscale,\n"
+                ")\n")
+    print("wrote functional_tensor shim at", path)
+else:
+    print("functional_tensor already present; leaving it alone")
+PY
+RUN python -c "from torchvision.transforms.functional_tensor import rgb_to_grayscale; print('basicsr import path OK')"
+
 # tail -40, not -5. The first failure here was a one-line pip resolver error
 # that the previous `tail -5` truncated away entirely, which turned a plainly
 # diagnosable build into a guess. The full log stays in the image regardless.
