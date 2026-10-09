@@ -119,7 +119,11 @@ def camera_params(image, manual_fov=None):
 
 def as_numpy(value):
     if hasattr(value, 'detach'):
-        value = value.detach().cpu().numpy()
+        value = value.detach()
+        # NumPy has no bfloat16 dtype; decoder outputs may use BF16.
+        if getattr(value.dtype, 'is_floating_point', False):
+            value = value.float()
+        value = value.cpu().numpy()
     return np.asarray(value)
 
 
@@ -181,18 +185,26 @@ def probe():
         except Exception as error:
             modules[name] = f'MISSING ({type(error).__name__}: {error})'
     gpu = None
+    kernel = {'ok':False,'error':'CUDA unavailable'}
     try:
         import torch
         if torch.cuda.is_available():
             device = torch.cuda.get_device_properties(0)
             gpu = {'name':device.name,'vram_gib':round(device.total_memory/1024**3,1),
                    'compute_capability':list(torch.cuda.get_device_capability(0))}
-    except Exception:
-        pass
+            from natten.functional import na2d
+            with torch.inference_mode():
+                q = torch.randn((1,8,8,1,32),device='cuda',dtype=torch.float16)
+                result = na2d(q,q,q,kernel_size=(3,3),backend='cutlass-fna')
+                torch.cuda.synchronize()
+                assert result.shape==q.shape and bool(torch.isfinite(result).all())
+            kernel = {'ok':True,'backend':'cutlass-fna'}
+    except Exception as error:
+        kernel = {'ok':False,'error':f'{type(error).__name__}: {error}'}
     return {'modules':modules,'gpu':gpu,'model':MODEL,'model_revision':os.environ.get('PIXAL3D_MODEL_REVISION',MODEL_REVISION),
             'worker_revision':os.environ.get('PIXAL3D_WORKER_REVISION','development'),
             'low_vram':setting_bool('PIXAL3D_LOW_VRAM',True),'weights_loaded':_PIPELINE is not None,
-            'attention_backend':os.environ.get('ATTN_BACKEND'),'background_remover':'u2net'}
+            'attention_backend':os.environ.get('ATTN_BACKEND'),'natten_kernel':kernel,'background_remover':'u2net'}
 
 
 def handler(event):

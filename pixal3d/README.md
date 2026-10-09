@@ -48,6 +48,15 @@ Cache these repositories using RunPod's model cache if available, or mount persi
 3. Compare the castle's saved prepared reference (`1410c0d8257ab5d14a55ee2b`) against raw colours and exports at identical game size. Check dark/pink regional fidelity, front/back orientation, geometry, inference time and actual cost. No user credits need to be charged for this standalone test. Do not overwrite its existing assets until reviewed.
 4. Return native sparse PBR arrays without a GLB/remeshing/texture-baking pass. The game compiler uses the existing archive, interiors and all-format export pipeline. A 180-degree horizontal rotation converts Pixal's -Y/Z-up canonical front to the game convention; validate it with an asymmetric reference. `PIXAL3D_FRONT_ROTATION=false` disables this transform for comparison. Archives carry the marker, and the old TRELLIS-only mirror does not run on Pixal outputs.
 
+The standalone helper validates GPU imports and runs a small NATTEN CUDA operation before downloading the large model. Supply the existing protected AI config; it never prints or saves the API key:
+
+```powershell
+python run-test.py --endpoint NEW_ENDPOINT_ID --config PATH_TO_AI_CONFIG --output probe-output
+python run-test.py --endpoint NEW_ENDPOINT_ID --config PATH_TO_AI_CONFIG --image reference-prepared.png --output castle-output
+```
+
+The second command buys one inference job. Outputs include job timings, provider metadata and the native voxel archive. A failed or timed-out test is cancelled rather than retried.
+
 ## Site configuration and rollback
 
 Once GPU validation passes, set `RUNPOD_PIXAL3D_ENDPOINT=<new id>` in `/etc/frombeyond/schematic-generator.env`, or `runpod_pixal3d_endpoint = <new id>` in the existing AI config. The existing `runpod_api_key` is reused. Install `pixal3d_provider.py`, the updated worker and server, and admin UI. Never point the old TRELLIS endpoint setting at a Pixal endpoint: automatic building selection would still send some jobs to Hunyuan.

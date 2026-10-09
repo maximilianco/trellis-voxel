@@ -33,7 +33,7 @@ RUN sed -e '/^git+https:\/\/github.com\/microsoft\/MoGe.git$/d' -e '/^gradio$/d'
     && pip install -c /workspace/torch-constraints.txt \
         "git+https://github.com/microsoft/MoGe.git@${MOGE_COMMIT}" \
         https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl \
-        cmake==3.30.8
+        cmake==3.30.9
 
 # Explicit architectures are essential: a CPU-only image builder would
 # otherwise silently install NATTEN without its GPU kernels.
