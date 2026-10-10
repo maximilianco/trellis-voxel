@@ -19,8 +19,11 @@ commercial revenue threshold before use.
 - Secret environment variable `HF_TOKEN`: read token with access to this model.
 - Default `SF3D_TEXTURE_RESOLUTION=1024`.
 - Cached model field: `https://huggingface.co/stabilityai/stable-fast-3d`.
+  Supply the gated model token in RunPod's model-cache settings too.
+  The worker reads the exact pinned snapshot from
+  `/runpod-volume/huggingface-cache/hub/models--stabilityai--stable-fast-3d/snapshots/f0c9a8ffd62cb1bbc8a7a53c9f87a0be1b6be778`.
   Runtime HF_HOME remains `/workspace/model-cache`, containing baked auxiliary
-  models. Without the RunPod model cache, the gated weights download once per
+  models. Without that RunPod model cache, the gated weights download once per
   container. To use a prepopulated snapshot, set `SF3D_MODEL_PATH` to the
   directory containing config.yaml and model.safetensors.
 
@@ -41,3 +44,13 @@ conversion. The site can voxelize the GLB on CPU after releasing the GPU worker.
 Native output is Y-up with the conditioning camera on -Z. The site adapter
 keeps this front direction and does not reuse Pixal's +Z-camera rotation.
 Textures are sampled from the embedded GLB atlas; no flat material fallback.
+
+## Builds
+
+The full Dockerfile compiles the pinned upstream dependencies. Handler-only
+changes use Dockerfile.runtime with the first published dependency image.
+GitHub builds detect changes to Dockerfile/constraints.txt, and a manual
+`full_build=true` also recompiles dependencies. After a dependency update,
+update Dockerfile.runtime's pinned base to the newly verified release.
+Huge optional GitHub Actions build-cache exports are disabled; dependency
+reuse happens through the pinned worker image instead.

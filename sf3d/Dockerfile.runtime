@@ -1,0 +1,7 @@
+# Reuse the verified compiled dependencies for handler-only releases.
+# Full dependency rebuilds use Dockerfile instead.
+FROM ghcr.io/maximilianco/trellis-voxel:sf3d-a8bfc88eeafaf5e662a37e91236c74eb92c6c91c
+ARG WORKER_REVISION=development
+ENV SF3D_WORKER_REVISION=${WORKER_REVISION}
+COPY handler.py /workspace/sf3d-handler.py
+LABEL org.opencontainers.image.revision=${WORKER_REVISION}

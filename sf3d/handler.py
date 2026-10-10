@@ -4,12 +4,39 @@ import io
 import os
 import time
 import threading
+from pathlib import Path
 
 MODEL = None
 REMBG = None
 LOCK = threading.Lock()
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_PIXELS = 16 * 1024 * 1024
+
+
+def cached_model_path():
+    explicit = os.environ.get('SF3D_MODEL_PATH')
+    if explicit:
+        path = Path(explicit)
+        if not all((path / name).is_file() for name in ['config.yaml','model.safetensors']):
+            raise RuntimeError('SF3D_MODEL_PATH must contain config.yaml and model.safetensors')
+        return str(path)
+    repository = os.environ.get('SF3D_MODEL_ID', 'stabilityai/stable-fast-3d')
+    revision = os.environ.get('SF3D_MODEL_REVISION', 'f0c9a8ffd62cb1bbc8a7a53c9f87a0be1b6be778')
+    hub = Path(os.environ.get('RUNPOD_MODEL_CACHE_DIR', '/runpod-volume/huggingface-cache/hub'))
+    path = hub / ('models--' + repository.replace('/', '--')) / 'snapshots' / revision
+    if all((path / name).is_file() for name in ['config.yaml','model.safetensors']):
+        return str(path)
+    return None
+
+
+def validate_gpu(torch):
+    if not torch.cuda.is_available():
+        raise RuntimeError('SF3D worker requires CUDA')
+    major, minor = torch.cuda.get_device_capability(0)
+    if major not in {8,9}:
+        raise RuntimeError('This SF3D CUDA 12.4 build requires an Ampere/Ada/Hopper GPU; '
+                           + torch.cuda.get_device_name(0) + ' has unsupported compute capability '
+                           + str(major)+'.'+str(minor))
 
 
 def decode_image(payload):
@@ -37,11 +64,10 @@ def load_model():
     if MODEL is not None:
         return MODEL
     import torch
+    validate_gpu(torch)
     from huggingface_hub import snapshot_download
     from sf3d.system import SF3D
-    if not torch.cuda.is_available():
-        raise RuntimeError('SF3D worker requires CUDA')
-    local = os.environ.get('SF3D_MODEL_PATH')
+    local = cached_model_path()
     if not local:
         local = snapshot_download(
             repo_id=os.environ.get('SF3D_MODEL_ID', 'stabilityai/stable-fast-3d'),
