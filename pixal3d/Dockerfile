@@ -53,17 +53,23 @@ path.write_text(text.replace(needle, '"/workspace/NAF", "naf", pretrained=True, 
 PY
 
 RUN python - <<'PY'
-import importlib, torch
+import importlib, importlib.util, py_compile, torch
 assert torch.__version__.startswith('2.6.0'), torch.__version__
 assert torch.version.cuda=='12.4', torch.version.cuda
-for name in ['inference','pixal3d','flex_gemm','cumesh','o_voxel','natten','moge','rembg']:
+# FlexGEMM's Triton autotuner initializes a CUDA driver during import.
+# GitHub image builders have no GPU. Check availability here; the endpoint's
+# required GPU probe imports the entire inference stack and runs CUDA kernels.
+for name in ['inference','pixal3d','flex_gemm','cumesh','o_voxel']:
+    assert importlib.util.find_spec(name) is not None, 'Missing '+name
+py_compile.compile('/workspace/Pixal3D/inference.py',doraise=True)
+for name in ['natten','moge','rembg']:
     importlib.import_module(name)
 from transformers import DINOv3ViTModel
 from natten import libnatten
 from natten.functional import na2d_qk, na2d_av
 from moge.model.v2 import MoGeModel
 torch.hub.load('/workspace/NAF','naf',source='local',pretrained=False,device='cpu')
-print('Pixal3D imports and compiled NATTEN kernel library verified; GPU smoke test still required')
+print('CPU dependencies and compiled NATTEN library verified; full inference imports and kernels require the GPU probe')
 PY
 
 # Keep the worker revision out of dependency layers so handler fixes reuse them.
