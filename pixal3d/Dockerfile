@@ -53,22 +53,28 @@ path.write_text(text.replace(needle, '"/workspace/NAF", "naf", pretrained=True, 
 PY
 
 RUN python - <<'PY'
-import importlib, importlib.util, py_compile, torch
+import ctypes, importlib, importlib.util, importlib.metadata, compileall, torch
+from pathlib import Path
 assert torch.__version__.startswith('2.6.0'), torch.__version__
 assert torch.version.cuda=='12.4', torch.version.cuda
-# FlexGEMM's Triton autotuner initializes a CUDA driver during import.
+# FlexGEMM's and NATTEN's Triton helpers query CUDA during import.
 # GitHub image builders have no GPU. Check availability here; the endpoint's
 # required GPU probe imports the entire inference stack and runs CUDA kernels.
-for name in ['inference','pixal3d','flex_gemm','cumesh','o_voxel']:
+for name in ['inference','pixal3d','flex_gemm','cumesh','o_voxel','natten']:
     assert importlib.util.find_spec(name) is not None, 'Missing '+name
-py_compile.compile('/workspace/Pixal3D/inference.py',doraise=True)
-for name in ['natten','moge','rembg']:
+assert compileall.compile_dir('/workspace/Pixal3D',quiet=1)
+assert compileall.compile_dir('/workspace/NAF',quiet=1)
+for name in ['moge','rembg']:
     importlib.import_module(name)
 from transformers import DINOv3ViTModel
-from natten import libnatten
-from natten.functional import na2d_qk, na2d_av
 from moge.model.v2 import MoGeModel
-torch.hub.load('/workspace/NAF','naf',source='local',pretrained=False,device='cpu')
+# Load the binary's actual linked libraries without executing NATTEN's
+# GPU-dependent package initializer. The GPU probe exercises its Python API.
+assert importlib.metadata.version('natten')=='0.17.5+torch260cu124'
+natten=Path(importlib.util.find_spec('natten').origin).parent
+extensions=list(natten.glob('libnatten*.so'))
+assert len(extensions)==1, 'Missing compiled NATTEN library'
+ctypes.CDLL(str(extensions[0]))
 print('CPU dependencies and compiled NATTEN library verified; full inference imports and kernels require the GPU probe')
 PY
 
