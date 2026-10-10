@@ -192,13 +192,20 @@ def probe():
             device = torch.cuda.get_device_properties(0)
             gpu = {'name':device.name,'vram_gib':round(device.total_memory/1024**3,1),
                    'compute_capability':list(torch.cuda.get_device_capability(0))}
-            from natten.functional import na2d
+            from natten.functional import na2d_qk, na2d_av
             with torch.inference_mode():
-                q = torch.randn((1,8,8,1,32),device='cuda',dtype=torch.float16)
-                result = na2d(q,q,q,kernel_size=(3,3),backend='cutlass-fna')
-                torch.cuda.synchronize()
+                q = torch.randn((1,1,8,8,32),device='cuda',dtype=torch.float32)
+                scores = na2d_qk(q,q,kernel_size=(3,3))
+                result = na2d_av(scores.softmax(-1),q,kernel_size=(3,3))
                 assert result.shape==q.shape and bool(torch.isfinite(result).all())
-            kernel = {'ok':True,'backend':'cutlass-fna'}
+                # Exercise NAF's real legacy path, without downloading weights.
+                naf = torch.hub.load('/workspace/NAF','naf',source='local',pretrained=False,device='cuda')
+                result = naf(torch.randn((1,3,18,18),device='cuda'),
+                             torch.randn((1,64,9,9),device='cuda'),(18,18))
+                torch.cuda.synchronize()
+                assert result.shape==(1,64,18,18) and bool(torch.isfinite(result).all())
+                del naf
+            kernel = {'ok':True,'backend':'legacy-qk-av','naf_tested':True,'pretrained':False}
     except Exception as error:
         kernel = {'ok':False,'error':f'{type(error).__name__}: {error}'}
     return {'modules':modules,'gpu':gpu,'model':MODEL,'model_revision':os.environ.get('PIXAL3D_MODEL_REVISION',MODEL_REVISION),

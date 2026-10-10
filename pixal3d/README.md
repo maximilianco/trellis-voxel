@@ -10,7 +10,7 @@ Published from `https://github.com/maximilianco/trellis-voxel`, with these files
 ghcr.io/maximilianco/trellis-voxel:pixal3d-<full worker commit SHA>
 ```
 
-The base is the successfully built TRELLIS.2 CUDA image `v2-01e1b90f4d897f0db04289ae1fa20977b8bd784e`. TRELLIS and Hunyuan tags are unchanged. Pixal source and model revisions, MoGe code and weights, DINO weights and NAF source are pinned. PyTorch remains 2.6/cu124 so inherited compiled extensions retain their ABI. NATTEN 0.21.0 builds CUDA kernels for Ampere/Ada; do not choose a Blackwell GPU for this image. Build failures are fatal. Weights are downloaded by the worker, rather than embedded in this image.
+The base is the successfully built TRELLIS.2 CUDA image `v2-01e1b90f4d897f0db04289ae1fa20977b8bd784e`. TRELLIS and Hunyuan tags are unchanged. Pixal source and model revisions, MoGe code and weights, DINO weights and NAF source are pinned. PyTorch remains 2.6/cu124 so inherited compiled extensions retain their ABI. NATTEN uses its official `0.17.5+torch260cu124` binary, compatible with NAF's legacy QK/AV attention interface. This avoids source compilation and cannot silently install a CPU-only variant. Dependencies are cached separately from the handler and worker revision. Do not choose a Blackwell GPU for this image. Build failures are fatal. Weights are downloaded by the worker, rather than embedded in this image.
 
 ## New endpoint
 
@@ -39,7 +39,7 @@ Cache these repositories using RunPod's model cache if available, or mount persi
 * `camenduru/dinov3-vitl16-pretrain-lvd1689m`
 * `Ruicheng/moge-2-vitl`
 
-`TORCH_HOME` additionally caches NAF's released weights and source. A slow first download should be distinguished from inference. Probe does not load weights. Background cutout uses u2net already baked into the base image; the worker does not instantiate `briaai/RMBG-2.0`. Pixal3D is MIT; upstream dependency licences still apply, including the DINO mirror's original DINOv3 terms.
+`TORCH_HOME` additionally caches NAF's released weights; pinned NAF source is baked into the image. A slow first download should be distinguished from inference. Probe does not load weights. Background cutout uses u2net already baked into the base image; the worker does not instantiate `briaai/RMBG-2.0`. Pixal3D is MIT; upstream dependency licences still apply, including the DINO mirror's original DINOv3 terms.
 
 ## Validate before switching
 
@@ -48,7 +48,7 @@ Cache these repositories using RunPod's model cache if available, or mount persi
 3. Compare the castle's saved prepared reference (`1410c0d8257ab5d14a55ee2b`) against raw colours and exports at identical game size. Check dark/pink regional fidelity, front/back orientation, geometry, inference time and actual cost. No user credits need to be charged for this standalone test. Do not overwrite its existing assets until reviewed.
 4. Return native sparse PBR arrays without a GLB/remeshing/texture-baking pass. The game compiler uses the existing archive, interiors and all-format export pipeline. A 180-degree horizontal rotation converts Pixal's -Y/Z-up canonical front to the game convention; validate it with an asymmetric reference. `PIXAL3D_FRONT_ROTATION=false` disables this transform for comparison. Archives carry the marker, and the old TRELLIS-only mirror does not run on Pixal outputs.
 
-The standalone helper validates GPU imports and runs a small NATTEN CUDA operation before downloading the large model. Supply the existing protected AI config; it never prints or saves the API key:
+The standalone helper validates GPU imports and runs both NATTEN QK/AV CUDA operations and NAF's actual upsampling path before downloading the large model. Supply the existing protected AI config; it never prints or saves the API key:
 
 ```powershell
 python run-test.py --endpoint NEW_ENDPOINT_ID --config PATH_TO_AI_CONFIG --output probe-output
@@ -65,6 +65,6 @@ The new server initializes the admin model selection to Pixal3D. Set `SCHEMATIC_
 
 Pixal failure raises a job error, rather than automatically purchasing a second reconstruction. Missing PBR channels also fail instead of publishing a monochrome build. Existing TRELLIS/Hunyuan fallback behaviour is unchanged when those routes are selected.
 
-The currently configured production RunPod key returned HTTP 403 for endpoint management. Creating the new endpoint requires the Console or a key with management access; normal job submission can reuse the existing key after the endpoint is created.
+The currently configured production RunPod key returned HTTP 403 for endpoint management. Creating the new endpoint requires the Console or a key with management access. Verify job submission permissions for the new endpoint with the probe; reuse the existing key if its endpoint scope permits it.
 
 Sources: [Pixal3D](https://github.com/TencentARC/Pixal3D), [inference code](https://github.com/TencentARC/Pixal3D/blob/master/inference.py), [NATTEN installation](https://natten.org/install/), [RunPod GitHub deployment](https://docs.runpod.io/serverless/workers/github-integration).

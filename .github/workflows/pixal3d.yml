@@ -24,7 +24,18 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - name: Cache Pixal3D dependencies
+        uses: docker/build-push-action@v6
+        with:
+          context: ./pixal3d
+          file: ./pixal3d/Dockerfile
+          target: dependencies
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=pixal3d-dependencies
+          cache-to: type=gha,mode=max,scope=pixal3d-dependencies
+      - name: Publish Pixal3D worker
+        uses: docker/build-push-action@v6
         with:
           context: ./pixal3d
           file: ./pixal3d/Dockerfile
@@ -32,5 +43,7 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository }}:pixal3d-${{ github.sha }}
           build-args: WORKER_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=pixal3d
+          cache-from: |
+            type=gha,scope=pixal3d-dependencies
+            type=gha,scope=pixal3d
           cache-to: type=gha,mode=max,scope=pixal3d
