@@ -22,12 +22,14 @@ RUN git clone https://github.com/TencentARC/Pixal3D.git /workspace/Pixal3D \
 COPY torch-constraints.txt /workspace/torch-constraints.txt
 
 # Keep compiled extensions bound to torch 2.6/cu124. Only replace the Python
-# dependencies Pixal3D requires. Gradio is unnecessary for a serverless worker.
+# dependencies Pixal3D requires. MoGe's optional Gradio/v3 app dependencies
+# conflict with this stack; install only its v2 camera-estimation imports.
 RUN sed -e '/^git+https:\/\/github.com\/microsoft\/MoGe.git$/d' -e '/^gradio$/d' \
         /workspace/Pixal3D/requirements.txt > /workspace/pixal-requirements.txt \
     && pip install -c /workspace/torch-constraints.txt -r /workspace/pixal-requirements.txt \
-    && pip install -c /workspace/torch-constraints.txt \
+    && pip install -c /workspace/torch-constraints.txt --no-deps \
         "git+https://github.com/microsoft/MoGe.git@${MOGE_COMMIT}" \
+        "git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37" \
         https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl
 
 # NAF supports the legacy QK/AV interface. Use the official binary matched
@@ -59,6 +61,7 @@ for name in ['inference','pixal3d','flex_gemm','cumesh','o_voxel','natten','moge
 from transformers import DINOv3ViTModel
 from natten import libnatten
 from natten.functional import na2d_qk, na2d_av
+from moge.model.v2 import MoGeModel
 torch.hub.load('/workspace/NAF','naf',source='local',pretrained=False,device='cpu')
 print('Pixal3D imports and compiled NATTEN kernel library verified; GPU smoke test still required')
 PY
