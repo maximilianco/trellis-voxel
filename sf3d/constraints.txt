@@ -1,0 +1,10 @@
+torch==2.4.1
+torchvision==0.19.1
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+onnxruntime-gpu==1.19.2
+scipy==1.14.1
+numba==0.60.0
+llvmlite==0.43.0
+Pillow==10.4.0
+safetensors==0.4.5
