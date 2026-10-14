@@ -1,0 +1,26 @@
+# The Hunyuan3D worker as a patch on the image production already runs.
+#
+# A full build of ./Dockerfile clones Hunyuan3D-2.1 at upstream HEAD and leaves
+# runpod, accelerate, onnxruntime and rembg unpinned, and its layer cache is
+# long evicted -- so rebuilding it to change the handler would also change
+# everything under the handler, and a test of the new image would no longer
+# say which of the two made the difference. Handler changes ship here instead,
+# on the exact image the endpoint was pinned to, and ./Dockerfile stays the
+# recipe for deliberate full rebuilds.
+ARG BASE=ghcr.io/maximilianco/trellis-voxel:hunyuan3d-91765d1b05f026f5b98f0d2beeade9226aecf49a
+FROM ${BASE}
+
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
+COPY handler.py /workspace/handler.py
+
+# Background removal must come out of the image, never a run-time download:
+# rembg's own default moved to a 1 GB model this image does not carry, and a
+# worker that could not fetch it went on without removing the background.
+# Asking for u2net has to find the copy baked into /root/.u2net; a download
+# would land under models/ and fail the build here instead of a job later.
+RUN python -c "import rembg; rembg.new_session('u2net')" \
+    && test ! -e /root/.u2net/models/u2net/u2net.onnx \
+    && test ! -e /root/.rembg/models/u2net/u2net.onnx \
+    && python -c "import rembg, importlib.metadata as m; print('u2net resolves to the baked file; rembg', m.version('rembg'))"

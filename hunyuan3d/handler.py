@@ -294,10 +294,129 @@ def _load_image(payload: dict):
     return Image.open(io.BytesIO(data)).convert("RGBA")
 
 
-def _cutout(image):
-    """A white background becomes geometry, so it has to go before generation."""
+_CUTOUT_MODEL = os.environ.get("CUTOUT_MODEL", "u2net")
+_CUTOUT_SESSION = None
+
+# Below this alpha a pixel is matting noise, not subject. Hunyuan frames the
+# subject by the bounding box of every pixel with any alpha at all, so a faint
+# speck in a corner widens that box to the whole picture and shrinks the
+# subject inside it.
+_FAINT_ALPHA = 16
+
+
+def _cutout(image) -> tuple:
+    """A white background becomes geometry, so it has to go before generation.
+
+    The model is named rather than left to rembg's default. rembg moved its
+    default from u2net to the 1 GB bria-rmbg in 2.0.80, which this image does
+    not carry, so every cold worker fetched it at run time -- and when that
+    failed, the job went on with the background still in the picture. The
+    u2net baked into the image is found through U2NET_HOME and needs no
+    network.
+
+    Raises rather than returning the uncut picture: a background that reaches
+    the shape model comes back as geometry, and as the sheets that then take
+    over the paint stage too.
+    """
+    import numpy as np
     import rembg
-    return rembg.remove(image)
+    from PIL import Image
+
+    global _CUTOUT_SESSION
+    if _CUTOUT_SESSION is None:
+        _CUTOUT_SESSION = rembg.new_session(_CUTOUT_MODEL)
+    cut = rembg.remove(image, session=_CUTOUT_SESSION).convert("RGBA")
+    alpha = np.asarray(cut)[..., 3]
+    faint = (alpha > 0) & (alpha < _FAINT_ALPHA)
+    alpha = np.where(faint, 0, alpha).astype(np.uint8)
+    solid = alpha > 127
+    coverage = float(solid.mean())
+    if not 0.005 <= coverage <= 0.95:
+        raise RuntimeError(f"background removal kept {coverage:.1%} of the picture as subject; "
+                           f"refusing to reconstruct a background or an empty frame")
+    rows, cols = np.nonzero(alpha)
+    framed = max(rows.max() - rows.min(), cols.max() - cols.min()) + 1
+    rows, cols = np.nonzero(solid)
+    subject = max(rows.max() - rows.min(), cols.max() - cols.min()) + 1
+    cut.putalpha(Image.fromarray(alpha))
+    return cut, {"model": _CUTOUT_MODEL, "coverage": round(coverage, 4),
+                 "faint_pixels_cleared": int(faint.sum()),
+                 "subject_fills_frame": round(float(subject / framed), 3)}
+
+
+def _drop_volume_plates(mesh) -> tuple:
+    """Remove thin plates the shape model lays across its whole volume.
+
+    A beach ball came back as the ball plus a separate slab 0.013 thick and
+    1.99 x 1.99 across -- the full 2.0 width of the generation volume in both
+    directions, cut off only by its edge. Nothing in the picture is that: it
+    is the field running out of bounds. Left in, it costs more than geometry.
+    The paint stage frames its views on the whole mesh, so the subject is a
+    small object in every view and the plate hides it from above; the ball
+    was painted green.
+
+    Only a separate piece that spans the volume edge to edge in two
+    directions and is thin in the third goes, and never the last piece: a
+    subject that genuinely is one flat square stays.
+    """
+    import numpy as np
+
+    parts = mesh.split(only_watertight=False)
+    if len(parts) < 2:
+        return mesh, []
+    low, high = mesh.bounds
+    span = float((high - low).max())
+
+    def plate(part):
+        extent = np.sort(part.bounds[1] - part.bounds[0])
+        return extent[1] >= 0.97 * span and extent[0] <= 0.05 * span
+
+    flags = [plate(part) for part in parts]
+    if all(flags):
+        return mesh, []
+    import trimesh
+    removed = [{"faces": int(len(part.faces)),
+                "extent": [round(float(x), 3) for x in part.bounds[1] - part.bounds[0]]}
+               for part, flag in zip(parts, flags) if flag]
+    if not removed:
+        return mesh, []
+    kept = trimesh.util.concatenate([part for part, flag in zip(parts, flags) if not flag])
+    return kept, removed
+
+
+def _texture_is_albedo(blob: bytes) -> bytes:
+    """Drop the colour factor trimesh invents for a textured OBJ material.
+
+    The paint stage writes an MTL with the boilerplate ``Kd 0.8 0.8 0.8`` beside
+    its ``map_Kd`` texture. Upstream converts to GLB through Blender, which
+    wires the image straight into Base Color; trimesh, loading the OBJ here,
+    makes that Kd a ``baseColorFactor`` of 0.8 instead, and every viewer then
+    shows the painted texture a fifth darker than it was painted. Only the RGB
+    factor of a textured material goes; alpha and untextured colours stay.
+    """
+    import json
+    import struct
+
+    if blob[:4] != b"glTF":
+        return blob
+    length, kind = struct.unpack_from("<II", blob, 12)
+    if kind != 0x4E4F534A:
+        return blob
+    document = json.loads(blob[20:20 + length])
+    changed = False
+    for material in document.get("materials", []):
+        pbr = material.get("pbrMetallicRoughness") or {}
+        factor = pbr.get("baseColorFactor")
+        if "baseColorTexture" in pbr and factor is not None and factor[:3] != [1, 1, 1]:
+            pbr["baseColorFactor"] = [1.0, 1.0, 1.0, factor[3] if len(factor) > 3 else 1.0]
+            changed = True
+    if not changed:
+        return blob
+    encoded = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * ((-len(encoded)) % 4)
+    rest = blob[20 + length + ((-length) % 4):]
+    body = struct.pack("<II", len(encoded), 0x4E4F534A) + encoded + rest
+    return struct.pack("<III", 0x46546C67, 2, 12 + len(body)) + body
 
 
 def _deliver(blob: bytes, job_id: str, prefer_volume: bool) -> dict:
@@ -335,12 +454,10 @@ def handler(event):
         import trimesh
 
         image = _load_image(payload)
+        cutout = None
         if payload.get("remove_background", True):
-            try:
-                image = _cutout(image)
-            except Exception as exc:  # noqa: BLE001
-                print(f"cutout unavailable ({type(exc).__name__}: {exc}); "
-                      f"a flat background will become geometry", flush=True)
+            image, cutout = _cutout(image)
+            print(f"cutout: {cutout}", flush=True)
         timings["load"] = round(time.time() - started, 2)
 
         mark = time.time()
@@ -363,6 +480,11 @@ def handler(event):
                 mesh = getattr(module, name)()(mesh)
             except Exception as exc:  # noqa: BLE001
                 print(f"{name} unavailable: {type(exc).__name__}: {exc}", flush=True)
+        # Before painting, not after: the paint stage frames its views on the
+        # whole mesh, so a plate left in spoils the colours as well as the shape.
+        mesh, plates = _drop_volume_plates(mesh)
+        if plates:
+            print(f"removed {len(plates)} volume-spanning plate(s): {plates}", flush=True)
 
         # Luanti player models live around 8k triangles, not the million a
         # generator will happily emit.
@@ -399,10 +521,12 @@ def handler(event):
         blob = mesh.export(file_type="glb")
         if isinstance(blob, str):
             blob = blob.encode("utf-8")
+        blob = _texture_is_albedo(blob)
         timings["total"] = round(time.time() - started, 2)
 
         result = {"counts": counts, "timings": timings,
-                  "textured": bool(payload.get("want_texture", True))}
+                  "textured": bool(payload.get("want_texture", True)),
+                  "cutout": cutout, "plates_removed": plates}
         result.update(_deliver(blob, job_id, bool(payload.get("force_volume", False))))
         return result
     except Exception as exc:  # noqa: BLE001 - a failed job must report, not vanish

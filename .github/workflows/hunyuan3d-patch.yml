@@ -1,0 +1,54 @@
+# Build the Hunyuan3D handler patch (hunyuan3d/Dockerfile.patch) and push an
+# immutable tag. Copy to .github/workflows/hunyuan3d-patch.yml in the repo
+# RunPod pulls from. Nothing moves a shared tag: an endpoint only changes when
+# it is pointed at a new hunyuan3d-patch-<sha> deliberately.
+name: build hunyuan3d patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hunyuan3d/handler.py"
+      - "hunyuan3d/Dockerfile.patch"
+      - ".github/workflows/hunyuan3d-patch.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The base is the full worker image; extracting it for the check step
+      # needs more than a default runner's free disk.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: hunyuan3d
+          file: hunyuan3d/Dockerfile.patch
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository }}:hunyuan3d-patch-${{ github.sha }}
+          build-args: GIT_SHA=${{ github.sha }}
+
+      - name: Image reference
+        run: echo "Pin on a test endpoint first:" "ghcr.io/${{ github.repository }}:hunyuan3d-patch-${{ github.sha }}"

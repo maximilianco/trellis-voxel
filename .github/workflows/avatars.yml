@@ -26,6 +26,11 @@ on:
     branches: [main]
     paths:
       - "hunyuan3d/**"
+      # Handler-only changes ship as a patch on the pinned image
+      # (hunyuan3d-patch.yml). A full rebuild re-resolves unpinned upstream
+      # code and packages, so it is only run on a Dockerfile change or by hand.
+      - "!hunyuan3d/handler.py"
+      - "!hunyuan3d/Dockerfile.patch"
       - "rig/**"
       - ".github/workflows/avatars.yml"
   workflow_dispatch:
