@@ -1,13 +1,14 @@
 # trellis-voxel
 
 RunPod serverless workers for the BlockGen project. The repo is named for the
-first one; it now holds three, built by two independent workflows.
+first one; it now holds four, built by three independent workflows.
 
 | worker | image tag | what it does |
 |---|---|---|
 | TRELLIS / TRELLIS.2 | `:v1` `:v2` | image to coloured voxel grid — root `Dockerfile*`, `handler.py` |
 | Hunyuan3D-2.1 | `:hunyuan3d` | image to textured glb — [`hunyuan3d/`](hunyuan3d/) |
 | SkinTokens | `:rig` | glb to auto-rigged glb — [`rig/`](rig/) |
+| ACE-Step 1.5 | `:ace-step` | text to music (instrumental loops, songs) — [`ace-step/`](ace-step/) |
 
 The last two are the avatar pipeline: a prompt becomes a rigged Luanti player
 model. See [PIPELINE.md](PIPELINE.md) for how the stages fit together, the GPU
