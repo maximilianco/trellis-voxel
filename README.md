@@ -10,6 +10,7 @@ first one; it now holds four, built by three independent workflows.
 | SkinTokens | `:rig` | glb to auto-rigged glb — [`rig/`](rig/) |
 | ACE-Step 1.5 | `:ace-step` | text to music (instrumental loops, songs) — [`ace-step/`](ace-step/) |
 | Z-Image-Turbo | `:zimage` | text to image (concept pictures for the 3D workers) — [`zimage/`](zimage/) |
+| MOSS-SoundEffect v2.0 | `:moss-sfx` | text to sound effect (48 kHz, up to 30 s) — [`moss-sfx/`](moss-sfx/) |
 
 The last two are the avatar pipeline: a prompt becomes a rigged Luanti player
 model. See [PIPELINE.md](PIPELINE.md) for how the stages fit together, the GPU
