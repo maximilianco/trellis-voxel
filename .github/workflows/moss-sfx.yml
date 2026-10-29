@@ -1,6 +1,7 @@
 # Build the MOSS-SoundEffect worker on GitHub's runners and push it to GHCR, like the other workers here.
 # Tags: ghcr.io/<repo>:moss-sfx and :moss-sfx-<sha> (pin the sha on the endpoint). The weights download at the
-# worker's first start, so the image holds only torch and the pipeline.
+# worker's first start, so the image holds only torch and the pipeline. The image is checked before it's pushed: the
+# pipeline must import, and a failure's last lines become the run's annotations (readable without the run's log).
 name: build moss-sfx worker
 
 on:
@@ -33,20 +34,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build
         uses: docker/build-push-action@v6
         with:
           context: moss-sfx
           file: moss-sfx/Dockerfile
           platforms: linux/amd64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:moss-sfx
-            ghcr.io/${{ github.repository }}:moss-sfx-${{ github.sha }}
+          load: true
+          tags: moss-sfx:check
           build-args: |
             GIT_SHA=${{ github.sha }}
 
-      - name: Image reference
+      - name: Check the pipeline imports
         run: |
+          out=$(docker run --rm moss-sfx:check python -c "from moss_soundeffect_v2 import MossSoundEffectPipeline; import runpod, audiotools; print('imports ok')" 2>&1) || {
+            echo "$out" | tail -15 | sed 's/^/::error::/'
+            exit 1
+          }
+          echo "$out"
+
+      - name: Push
+        run: |
+          for tag in moss-sfx moss-sfx-${{ github.sha }}; do
+            docker tag moss-sfx:check ghcr.io/${{ github.repository }}:$tag
+            docker push ghcr.io/${{ github.repository }}:$tag
+          done
           echo "Pin this on the endpoint: ghcr.io/${{ github.repository }}:moss-sfx-${{ github.sha }}"
           echo "Endpoint: a 24 GB GPU, CUDA 12.8 hosts, 30 GB container disk."
