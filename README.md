@@ -9,6 +9,7 @@ first one; it now holds four, built by three independent workflows.
 | Hunyuan3D-2.1 | `:hunyuan3d` | image to textured glb — [`hunyuan3d/`](hunyuan3d/) |
 | SkinTokens | `:rig` | glb to auto-rigged glb — [`rig/`](rig/) |
 | ACE-Step 1.5 | `:ace-step` | text to music (instrumental loops, songs) — [`ace-step/`](ace-step/) |
+| Z-Image-Turbo | `:zimage` | text to image (concept pictures for the 3D workers) — [`zimage/`](zimage/) |
 
 The last two are the avatar pipeline: a prompt becomes a rigged Luanti player
 model. See [PIPELINE.md](PIPELINE.md) for how the stages fit together, the GPU
