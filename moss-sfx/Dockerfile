@@ -16,8 +16,7 @@ RUN pip install --no-cache-dir --root-user-action=ignore --no-deps "descript-aud
 RUN pip install --no-cache-dir --root-user-action=ignore --extra-index-url https://download.pytorch.org/whl/cu128 \
     argbind pyloudnorm importlib-resources scipy julius ffmpy ipython rich matplotlib librosa pystoi torch-stoi flatten-dict markdown2 randomname tensorboard \
     "torch==2.9.0+cu128" "torchaudio==2.9.0+cu128" "numpy==1.26.4" "einops==0.8.2" "pillow==12.2.0" "tqdm==4.67.3" "safetensors==0.7.0" \
-    "transformers==4.57.1" "diffusers==0.37.1" "ftfy==6.3.1" "regex==2026.4.4" "soundfile==0.13.1" "imageio==2.37.3" \
- && python -c "from moss_soundeffect_v2 import MossSoundEffectPipeline; import runpod, audiotools"
+    "transformers==4.57.1" "diffusers==0.37.1" "ftfy==6.3.1" "regex==2026.4.4" "soundfile==0.13.1" "imageio==2.37.3"
 
 ARG GIT_SHA=unknown
 ENV WORKER_COMMIT=${GIT_SHA}
