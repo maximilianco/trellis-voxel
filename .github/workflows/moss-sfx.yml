@@ -47,7 +47,7 @@ jobs:
 
       - name: Check the pipeline imports
         run: |
-          out=$(docker run --rm moss-sfx:check python -c "from moss_soundeffect_v2 import MossSoundEffectPipeline; import runpod, audiotools; print('imports ok')" 2>&1) || {
+          out=$(docker run --rm moss-sfx:check python -c "from moss_soundeffect_v2 import MossSoundEffectPipeline; import runpod, audiotools, soundfile; print('imports ok')" 2>&1) || {
             echo "$out" | tail -15 | sed 's/^/::error::/'
             exit 1
           }

@@ -21,6 +21,7 @@ import tempfile
 import time
 
 import runpod
+import soundfile
 import torch
 
 MODEL = os.environ.get("MOSS_SFX_MODEL", "OpenMOSS-Team/MOSS-SoundEffect-v2.0")
@@ -61,7 +62,8 @@ def sound(pipe, prompt, seconds, steps, cfg_scale, seed, audio_format):
     audio = pipe(prompt=prompt, seconds=seconds, num_inference_steps=steps, cfg_scale=cfg_scale)
     with tempfile.TemporaryDirectory() as folder:
         wav = os.path.join(folder, "sound.wav")
-        pipe.save_audio(audio, wav)
+        # Written with soundfile: the pipeline's save_audio goes through torchaudio 2.9, which wants torchcodec.
+        soundfile.write(wav, audio[0].detach().float().cpu().numpy().T, getattr(pipe, "sample_rate", 48000))
         path = wav
         if audio_format == "mp3":
             path = os.path.join(folder, "sound.mp3")
