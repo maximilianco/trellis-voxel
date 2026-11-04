@@ -76,6 +76,139 @@ from PIL import Image  # noqa: E402
 _DEFAULT_MODEL = {"1": "microsoft/TRELLIS-image-large", "2": "microsoft/TRELLIS.2-4B"}
 _PIPELINE = None
 _VERSION = None
+# Where the cold-start load went, per model: returned with the first job's
+# timings so a slow start can be read from the job output, not guessed at.
+_LOAD_STEPS: dict = {}
+
+
+def _fast_load() -> bool:
+    return os.environ.get("TRELLIS_FAST_LOAD", "1") != "0"
+
+
+class _skip_weight_init:
+    """Build a module without filling its weights with random numbers.
+
+    TRELLIS.2's loader constructs each model -- three 1.3B-parameter DiTs among
+    them -- with the usual random initialisation on the CPU and only then
+    copies the checkpoint over it. A cold worker spent 87-108 s in that loader
+    (4 Nov, production endpoint). The random fill is thrown away, so the init
+    functions are made no-ops while the model is built; anything the checkpoint
+    then fails to supply is caught by _load_model and built the slow way.
+    """
+
+    NAMES = ("uniform_", "normal_", "trunc_normal_", "constant_", "ones_", "zeros_",
+             "eye_", "dirac_", "xavier_uniform_", "xavier_normal_", "kaiming_uniform_",
+             "kaiming_normal_", "orthogonal_", "sparse_")
+
+    def __enter__(self):
+        import torch
+
+        self._saved = {name: getattr(torch.nn.init, name)
+                       for name in self.NAMES if hasattr(torch.nn.init, name)}
+        for name in self._saved:
+            setattr(torch.nn.init, name, lambda tensor, *args, **kwargs: tensor)
+        return self
+
+    def __exit__(self, *exc):
+        import torch
+
+        for name, function in self._saved.items():
+            setattr(torch.nn.init, name, function)
+        return False
+
+
+def _install_timed_loader() -> None:
+    """Replace trellis2.models.from_pretrained with a timed (and faster) copy.
+
+    Same file resolution as upstream (a local path, else hf_hub_download -- a
+    download whenever the file is not in the HF cache), same construction and
+    load_state_dict(strict=False). Steps per model: resolve, build, read, copy.
+    """
+    import json
+
+    import trellis2.models as models
+
+    if getattr(models.from_pretrained, "_timed", False):
+        return
+    upstream = models.from_pretrained
+
+    def from_pretrained(path: str, **kwargs):
+        from safetensors.torch import load_file
+
+        steps = {}
+        mark = time.time()
+        if os.path.exists(f"{path}.json") and os.path.exists(f"{path}.safetensors"):
+            config_file, model_file = f"{path}.json", f"{path}.safetensors"
+        else:
+            from huggingface_hub import hf_hub_download
+
+            parts = path.split("/")
+            repo_id, name = f"{parts[0]}/{parts[1]}", "/".join(parts[2:])
+            config_file = hf_hub_download(repo_id, f"{name}.json")
+            model_file = hf_hub_download(repo_id, f"{name}.safetensors")
+        steps["resolve"] = round(time.time() - mark, 2)
+
+        with open(config_file, "r") as handle:
+            config = json.load(handle)
+        cls = getattr(models, config["name"])
+        mark = time.time()
+        if _fast_load():
+            with _skip_weight_init():
+                model = cls(**config["args"], **kwargs)
+        else:
+            model = cls(**config["args"], **kwargs)
+        steps["build"] = round(time.time() - mark, 2)
+
+        mark = time.time()
+        state = load_file(model_file)
+        steps["read"] = round(time.time() - mark, 2)
+        steps["gb"] = round(sum(t.numel() * t.element_size() for t in state.values()) / 1e9, 2)
+
+        mark = time.time()
+        result = model.load_state_dict(state, strict=False)
+        steps["copy"] = round(time.time() - mark, 2)
+        del state
+
+        parameters = {name for name, _ in model.named_parameters()}
+        unfilled = [key for key in result.missing_keys if key in parameters]
+        if _fast_load() and unfilled:
+            # Never ship uninitialised weights: build this one the old way.
+            print(f"WARNING: {path} leaves {len(unfilled)} parameters to init "
+                  f"(e.g. {unfilled[:3]}); building it with init", flush=True)
+            mark = time.time()
+            model = upstream(path, **kwargs)
+            steps["rebuilt"] = round(time.time() - mark, 2)
+        if result.missing_keys:
+            steps["missing_keys"] = len(result.missing_keys)
+        _LOAD_STEPS[path.split("/")[-1]] = steps
+        print(f"loaded {path.split('/')[-1]}: {steps}", flush=True)
+        return model
+
+    from_pretrained._timed = True
+    models.from_pretrained = from_pretrained
+
+    from trellis2.modules import image_feature_extractor as extractors
+
+    original_init = extractors.DinoV3FeatureExtractor.__init__
+
+    def timed_init(self, *args, **kwargs):
+        mark = time.time()
+        original_init(self, *args, **kwargs)
+        _LOAD_STEPS["image_cond_model"] = {"load": round(time.time() - mark, 2)}
+        print(f"loaded image_cond_model: {_LOAD_STEPS['image_cond_model']}", flush=True)
+
+    extractors.DinoV3FeatureExtractor.__init__ = timed_init
+
+
+def _low_vram(total_gb: float) -> bool:
+    """TRELLIS.2's low-VRAM mode keeps every model on the CPU and moves each to
+    the GPU for its stage and back. It is what lets the 4B pipeline run on a
+    24 GB card, and it costs time in every job. ``TRELLIS_LOW_VRAM``: 1 or 0
+    forces it; auto (default) turns it off on cards of 40 GB or more."""
+    setting = os.environ.get("TRELLIS_LOW_VRAM", "auto").strip().lower()
+    if setting in ("0", "1"):
+        return setting == "1"
+    return total_gb < 40
 
 
 def version() -> str:
@@ -141,6 +274,17 @@ def pipeline():
                     def __init__(self, *args, **kwargs):
                         pass
 
+                    # The pipeline moves its rembg model with the others when
+                    # low-VRAM mode is off.
+                    def to(self, *args, **kwargs):
+                        return self
+
+                    def cuda(self):
+                        return self
+
+                    def cpu(self):
+                        return self
+
                     def __call__(self, *args, **kwargs):
                         raise RuntimeError(
                             "background removal reached the stubbed RMBG-2.0: the "
@@ -164,8 +308,12 @@ def pipeline():
                     "tex_slat_decoder", "tex_slat_flow_model_512",
                 ]
                 print("loading 512 models only (skipping the 1024 DiTs)", flush=True)
-            print(f"loading Trellis2ImageTo3DPipeline from {path}", flush=True)
+            _install_timed_loader()
+            print(f"loading Trellis2ImageTo3DPipeline from {path} "
+                  f"(fast load {'on' if _fast_load() else 'off'})", flush=True)
+            mark = time.time()
             _PIPELINE = Trellis2ImageTo3DPipeline.from_pretrained(path)
+            _LOAD_STEPS["pipeline_total"] = round(time.time() - mark, 2)
         else:
             import trellis.pipelines as pipelines
 
@@ -187,11 +335,19 @@ def pipeline():
             # a 24 GB card with 22.4 GiB in use. The device property honours an
             # explicit _device, so point the pipeline at CUDA and let it do the
             # staging itself.
+            total_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            if version() == "2":
+                _PIPELINE.low_vram = _low_vram(total_gb)
+            mark = time.time()
             if version() == "2" and getattr(_PIPELINE, "low_vram", False):
                 _PIPELINE._device = torch.device("cuda")
                 print("v2 low_vram: models stay on CPU and move per stage", flush=True)
             else:
                 _PIPELINE.cuda()
+                print(f"all models resident on the GPU ({total_gb:.0f} GB card)", flush=True)
+            _LOAD_STEPS["to_gpu"] = round(time.time() - mark, 2)
+            _LOAD_STEPS["low_vram"] = bool(getattr(_PIPELINE, "low_vram", False))
+            _LOAD_STEPS["gpu"] = torch.cuda.get_device_name(0)
     return _PIPELINE
 
 
@@ -621,6 +777,11 @@ def handler(event):
             return {"error": "decoded to zero occupied voxels",
                     "hint": "the subject may have been removed by background cutout"}
         timings["total"] = round(time.time() - started, 2)
+        if _LOAD_STEPS:
+            # Only the job that paid for the load reports it.
+            timings["load_steps"] = dict(_LOAD_STEPS)
+            _LOAD_STEPS.clear()
+        mark = time.time()
 
         payload_out = {
             "resolution": resolution,
@@ -640,6 +801,15 @@ def handler(event):
                   "colours": result.get("colours"), "opacity": result.get("opacity"),
                   "metallic": result.get("metallic"), "roughness": result.get("roughness"),
                   "density": result.get("density")}
+        # Two loads of the same picture and seed must give the same voxels; the
+        # digest lets a changed loader be checked against the old one.
+        import hashlib
+
+        digest = hashlib.sha256()
+        for name in ("coords", "colours"):
+            if fields[name] is not None:
+                digest.update(np.ascontiguousarray(fields[name]).tobytes())
+        payload_out["digest"] = digest.hexdigest()[:16]
         if len(coords) > PACK_THRESHOLD:
             payload_out["packed"] = _pack(fields)
             payload_out["encoding"] = "npz+zlib+base64"

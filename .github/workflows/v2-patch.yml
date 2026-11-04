@@ -1,0 +1,54 @@
+# Build the TRELLIS.2 handler patch (v2-patch/Dockerfile.patch) and push an
+# immutable tag. Nothing moves a shared tag: an endpoint only changes when it is
+# pointed at a new v2-patch-<sha> deliberately, on a test endpoint first.
+name: build trellis v2 patch
+
+on:
+  push:
+    # patch/** builds a test image without merging, and without the full v1+v2
+    # rebuild that build.yml starts for handler.py changes on main.
+    branches: [main, "patch/**"]
+    paths:
+      - "handler.py"
+      - "v2-patch/Dockerfile.patch"
+      - ".github/workflows/v2-patch.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The base is the full ~20 GB worker image.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: v2-patch/Dockerfile.patch
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository }}:v2-patch-${{ github.sha }}
+          build-args: GIT_SHA=${{ github.sha }}
+
+      - name: Image reference
+        run: echo "Pin on a test endpoint first:" "ghcr.io/${{ github.repository }}:v2-patch-${{ github.sha }}"
