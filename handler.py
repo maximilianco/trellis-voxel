@@ -428,55 +428,45 @@ def _cutout(image: "Image.Image") -> "Image.Image":
 
     if image.mode == "RGBA" and not np.all(np.array(image)[:, :, 3] == 255):
         return image                      # already cut out; nothing to do
-    from rembg import remove
+    from PIL import ImageOps
 
-    # The session is named and kept. remove() without one builds a new session
-    # per call from rembg's default model -- which moved to bria-rmbg: a ~1 GB
-    # download on every cold worker (45-60 s of each 4 Nov production build)
-    # and BRIA's non-commercial licence, the very model this function exists
-    # to avoid. "u2net" resolves to the copy baked into /root/.u2net.
-    return remove(image.convert("RGBA"), session=_rembg_session())
-
-
-def _diagnose_cutout(image: "Image.Image") -> dict:
-    """Where the u2net cutout's time goes: per thread setting, a fresh session,
-    then two predictions (cold, warm), and the providers onnxruntime chose."""
-    import onnxruntime as ort
-    from rembg import new_session
-
-    report = {"ort": ort.__version__, "device": ort.get_device(),
-              "available": ort.get_available_providers()}
-    rgb = image.convert("RGB")
-    for threads in (0, 1, 4, 16):
-        options = ort.SessionOptions()
-        if threads:
-            options.intra_op_num_threads = threads
-            options.inter_op_num_threads = 1
-        mark = time.time()
-        session = new_session("u2net", sess_opts=options)
-        entry = {"session": round(time.time() - mark, 2),
-                 "providers": session.inner_session.get_providers()}
-        for run in ("cold", "warm"):
-            mark = time.time()
-            session.predict(rgb)
-            entry[run] = round(time.time() - mark, 2)
-        report[f"threads_{threads or 'default'}"] = entry
-        print(f"cutout diagnosis threads={threads or 'default'}: {entry}", flush=True)
-    return report
+    # u2net is run here directly, the way rembg's remove() runs it with its
+    # defaults (orientation fix, U2netSession.predict, naive_cutout) -- but
+    # without importing rembg, whose top-level imports (pymatting, scikit-image,
+    # scipy) took 40-45 s on every cold production worker (5 Nov): the cutout
+    # itself is about a second.
+    img = ImageOps.exif_transpose(image.convert("RGBA"))
+    session = _u2net_session()
+    resized = np.array(img.convert("RGB").resize((320, 320), Image.Resampling.LANCZOS))
+    resized = resized / max(np.max(resized), 1e-6)
+    tensor = np.zeros((resized.shape[0], resized.shape[1], 3))
+    for channel, (mean, std) in enumerate(zip((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))):
+        tensor[:, :, channel] = (resized[:, :, channel] - mean) / std
+    tensor = np.expand_dims(tensor.transpose((2, 0, 1)), 0).astype(np.float32)
+    prediction = session.run(None, {session.get_inputs()[0].name: tensor})[0][:, 0, :, :]
+    high, low = np.max(prediction), np.min(prediction)
+    prediction = np.squeeze((prediction - low) / (high - low))
+    mask = Image.fromarray((prediction.clip(0, 1) * 255).astype("uint8"), mode="L")
+    mask = mask.resize(img.size, Image.Resampling.LANCZOS)
+    return Image.composite(img, Image.new("RGBA", img.size, 0), mask)
 
 
-_REMBG_SESSION = None
+_U2NET_SESSION = None
 
 
-def _rembg_session():
-    global _REMBG_SESSION
-    if _REMBG_SESSION is None:
-        from rembg import new_session
+def _u2net_session():
+    """The u2net model baked into the image (Dockerfile.v2: /root/.u2net), on
+    the CPU provider rembg used with the CPU onnxruntime this image carries."""
+    global _U2NET_SESSION
+    if _U2NET_SESSION is None:
+        import onnxruntime as ort
 
         mark = time.time()
-        _REMBG_SESSION = new_session("u2net")
-        _LOAD_STEPS["rembg_session"] = round(time.time() - mark, 2)
-    return _REMBG_SESSION
+        home = os.path.expanduser(os.environ.get("U2NET_HOME", os.path.join("~", ".u2net")))
+        _U2NET_SESSION = ort.InferenceSession(os.path.join(home, "u2net.onnx"),
+                                              providers=["CPUExecutionProvider"])
+        _LOAD_STEPS["u2net_session"] = round(time.time() - mark, 2)
+    return _U2NET_SESSION
 
 
 def reduce_to(coords: np.ndarray, attrs, source: int, target: int):
@@ -815,11 +805,6 @@ def handler(event):
         if payload.get("remove_background", True):
             # Cut out first, so preprocess_image takes its has_alpha branch and
             # never loads the gated, non-commercial RMBG-2.0.
-            if payload.get("diagnose_cutout"):
-                try:
-                    timings["cutout_diagnosis"] = _diagnose_cutout(image)
-                except Exception as exc:  # noqa: BLE001 - a diagnosis never fails the job
-                    timings["cutout_diagnosis"] = {"error": f"{type(exc).__name__}: {exc}"}
             try:
                 mark = time.time()
                 image = _cutout(image)

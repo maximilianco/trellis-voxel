@@ -13,15 +13,11 @@ ENV GIT_SHA=${GIT_SHA}
 
 COPY handler.py /workspace/handler.py
 
-# Background removal must come out of the image, never a run-time download:
-# rembg's default moved to bria-rmbg (~1 GB, non-commercial), which cost every
-# cold production build 45-60 s. The handler asks for u2net by name; that must
-# find the copy baked into /root/.u2net, and a download -- which would land
-# under a models/ folder -- fails the build here instead of a job later.
-RUN python -c "import rembg; rembg.new_session('u2net')" \
-    && test ! -e /root/.u2net/models/u2net/u2net.onnx \
-    && test ! -e /root/.rembg/models/u2net/u2net.onnx \
-    && python -c "import importlib.metadata as m; print('u2net resolves to the baked file; rembg', m.version('rembg'))"
+# The handler runs u2net with onnxruntime directly instead of importing rembg,
+# whose top-level imports (pymatting, scikit-image, scipy) cost every cold
+# production worker 40-45 s (5 Nov). The model must load from the copy baked
+# into /root/.u2net; fail the build here, not a job later.
+RUN python -c "import onnxruntime as o; s = o.InferenceSession('/root/.u2net/u2net.onnx', providers=['CPUExecutionProvider']); print('u2net loads; input', s.get_inputs()[0].name, '| onnxruntime', o.__version__)"
 
 # The handler's timed loader re-implements trellis2.models.from_pretrained and
 # wraps DinoV3FeatureExtractor. Fail the build, not a job, if the TRELLIS.2 in
