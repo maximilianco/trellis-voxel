@@ -45,13 +45,50 @@ import sys
 import time
 import traceback
 
-import numpy as np
-
 os.environ.setdefault("ATTN_BACKEND", "xformers")
 os.environ.setdefault("SPCONV_ALGO", "native")
 # TRELLIS.2 allocates in large, uneven blocks and the OOM we hit reported
 # 3.87 GiB reserved but unallocated -- fragmentation, not genuine exhaustion.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def _cpu_allowance() -> tuple[int, dict]:
+    """CPUs this container may use: its cgroup quota, not the host's core count.
+
+    onnxruntime (rembg's u2net) and torch size their thread pools from the CPUs
+    they can see, which in a RunPod worker is the whole host. With a quota of a
+    few cores those threads mostly wait for each other: the u2net cutout -- a
+    320x320 model, about a second -- took 38-45 s per job (5 Nov).
+    """
+    seen = {"host": os.cpu_count()}
+    try:
+        seen["affinity"] = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        seen["affinity"] = os.cpu_count() or 1
+    quota = None
+    try:
+        limit, period = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if limit != "max":
+            quota = int(limit) / int(period)
+    except (OSError, ValueError):
+        try:
+            limit = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+            period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+            if limit > 0:
+                quota = limit / period
+        except (OSError, ValueError):
+            pass
+    seen["quota"] = None if quota is None else round(quota, 2)
+    usable = seen["affinity"] if quota is None else min(seen["affinity"], quota)
+    return max(1, int(usable)), seen
+
+
+_CPUS, _CPU_SEEN = _cpu_allowance()
+# Before torch or onnxruntime is imported: both read it when they start.
+os.environ.setdefault("OMP_NUM_THREADS", str(_CPUS))
+print(f"cpu threads {os.environ['OMP_NUM_THREADS']} ({_CPU_SEEN})", flush=True)
+
+import numpy as np  # noqa: E402  (after OMP_NUM_THREADS, which its BLAS reads)
 
 # Runpod's cached-model feature puts weights at /runpod-volume/huggingface-cache
 # in the standard HF layout. If HF_HOME points anywhere else, from_pretrained
@@ -350,6 +387,8 @@ def pipeline():
             _LOAD_STEPS["to_gpu"] = round(time.time() - mark, 2)
             _LOAD_STEPS["low_vram"] = bool(getattr(_PIPELINE, "low_vram", False))
             _LOAD_STEPS["gpu"] = torch.cuda.get_device_name(0)
+            _LOAD_STEPS["cpu"] = dict(_CPU_SEEN, threads=int(os.environ["OMP_NUM_THREADS"]),
+                                      torch_threads=torch.get_num_threads())
     return _PIPELINE
 
 
