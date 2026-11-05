@@ -248,7 +248,9 @@ def pipeline():
 
         path = model_path()
         if version() == "2":
+            mark = time.time()
             from trellis2.pipelines import Trellis2ImageTo3DPipeline
+            _LOAD_STEPS["import"] = round(time.time() - mark, 2)
 
             # from_pretrained builds the background remover unconditionally:
             #     pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(...)
@@ -385,7 +387,26 @@ def _cutout(image: "Image.Image") -> "Image.Image":
         return image                      # already cut out; nothing to do
     from rembg import remove
 
-    return remove(image.convert("RGBA"))
+    # The session is named and kept. remove() without one builds a new session
+    # per call from rembg's default model -- which moved to bria-rmbg: a ~1 GB
+    # download on every cold worker (45-60 s of each 4 Nov production build)
+    # and BRIA's non-commercial licence, the very model this function exists
+    # to avoid. "u2net" resolves to the copy baked into /root/.u2net.
+    return remove(image.convert("RGBA"), session=_rembg_session())
+
+
+_REMBG_SESSION = None
+
+
+def _rembg_session():
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        from rembg import new_session
+
+        mark = time.time()
+        _REMBG_SESSION = new_session("u2net")
+        _LOAD_STEPS["rembg_session"] = round(time.time() - mark, 2)
+    return _REMBG_SESSION
 
 
 def reduce_to(coords: np.ndarray, attrs, source: int, target: int):
@@ -725,7 +746,9 @@ def handler(event):
             # Cut out first, so preprocess_image takes its has_alpha branch and
             # never loads the gated, non-commercial RMBG-2.0.
             try:
+                mark = time.time()
                 image = _cutout(image)
+                timings["cutout"] = round(time.time() - mark, 2)
             except Exception as exc:
                 print(f"cutout unavailable ({type(exc).__name__}: {exc}); "
                       f"falling back to the pipeline's own remover", flush=True)
