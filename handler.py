@@ -84,9 +84,13 @@ def _cpu_allowance() -> tuple[int, dict]:
 
 
 _CPUS, _CPU_SEEN = _cpu_allowance()
-# Before torch or onnxruntime is imported: both read it when they start.
-os.environ.setdefault("OMP_NUM_THREADS", str(_CPUS))
-print(f"cpu threads {os.environ['OMP_NUM_THREADS']} ({_CPU_SEEN})", flush=True)
+# Before torch or onnxruntime is imported: both read it when they start. Only
+# when there is a quota to respect -- RunPod workers showed none (96 CPUs, no
+# cgroup limit, 5 Nov), and setting it there anyway changed nothing but torch's
+# thread count, and with it the low bits of the output.
+if _CPU_SEEN["quota"] is not None:
+    os.environ.setdefault("OMP_NUM_THREADS", str(_CPUS))
+print(f"cpu threads {os.environ.get('OMP_NUM_THREADS', 'default')} ({_CPU_SEEN})", flush=True)
 
 import numpy as np  # noqa: E402  (after OMP_NUM_THREADS, which its BLAS reads)
 
@@ -387,7 +391,7 @@ def pipeline():
             _LOAD_STEPS["to_gpu"] = round(time.time() - mark, 2)
             _LOAD_STEPS["low_vram"] = bool(getattr(_PIPELINE, "low_vram", False))
             _LOAD_STEPS["gpu"] = torch.cuda.get_device_name(0)
-            _LOAD_STEPS["cpu"] = dict(_CPU_SEEN, threads=int(os.environ["OMP_NUM_THREADS"]),
+            _LOAD_STEPS["cpu"] = dict(_CPU_SEEN, omp=os.environ.get("OMP_NUM_THREADS"),
                                       torch_threads=torch.get_num_threads())
     return _PIPELINE
 
@@ -432,6 +436,33 @@ def _cutout(image: "Image.Image") -> "Image.Image":
     # and BRIA's non-commercial licence, the very model this function exists
     # to avoid. "u2net" resolves to the copy baked into /root/.u2net.
     return remove(image.convert("RGBA"), session=_rembg_session())
+
+
+def _diagnose_cutout(image: "Image.Image") -> dict:
+    """Where the u2net cutout's time goes: per thread setting, a fresh session,
+    then two predictions (cold, warm), and the providers onnxruntime chose."""
+    import onnxruntime as ort
+    from rembg import new_session
+
+    report = {"ort": ort.__version__, "device": ort.get_device(),
+              "available": ort.get_available_providers()}
+    rgb = image.convert("RGB")
+    for threads in (0, 1, 4, 16):
+        options = ort.SessionOptions()
+        if threads:
+            options.intra_op_num_threads = threads
+            options.inter_op_num_threads = 1
+        mark = time.time()
+        session = new_session("u2net", sess_opts=options)
+        entry = {"session": round(time.time() - mark, 2),
+                 "providers": session.inner_session.get_providers()}
+        for run in ("cold", "warm"):
+            mark = time.time()
+            session.predict(rgb)
+            entry[run] = round(time.time() - mark, 2)
+        report[f"threads_{threads or 'default'}"] = entry
+        print(f"cutout diagnosis threads={threads or 'default'}: {entry}", flush=True)
+    return report
 
 
 _REMBG_SESSION = None
@@ -784,6 +815,11 @@ def handler(event):
         if payload.get("remove_background", True):
             # Cut out first, so preprocess_image takes its has_alpha branch and
             # never loads the gated, non-commercial RMBG-2.0.
+            if payload.get("diagnose_cutout"):
+                try:
+                    timings["cutout_diagnosis"] = _diagnose_cutout(image)
+                except Exception as exc:  # noqa: BLE001 - a diagnosis never fails the job
+                    timings["cutout_diagnosis"] = {"error": f"{type(exc).__name__}: {exc}"}
             try:
                 mark = time.time()
                 image = _cutout(image)
